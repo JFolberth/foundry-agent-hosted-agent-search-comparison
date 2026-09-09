@@ -857,6 +857,21 @@ def apply_stage(session):
     print("Exact saved plan applied. Output/logs remain private. Readiness is checked separately with verify.")
 
 
+def buildx_plugin_directory(plugins):
+    require(isinstance(plugins, list) and all(isinstance(item, dict) for item in plugins),
+            "Docker returned invalid CLI plugin metadata.")
+    matches = [item for item in plugins if item.get("Name") == "buildx"]
+    require(len(matches) == 1 and not matches[0].get("Err"),
+            "A working, installed Docker Buildx plugin is required.")
+    value = matches[0].get("Path")
+    require(isinstance(value, str) and value, "Docker did not report the Buildx plugin path.")
+    path = Path(value)
+    require(path.is_absolute() and path.name in ("docker-buildx", "docker-buildx.exe")
+            and path.is_file() and os.access(path, os.X_OK),
+            "Docker's Buildx plugin must be an existing executable at an absolute path.")
+    return str(path.parent)
+
+
 def build_images(session):
     outputs = session.outputs()
     name, registry = session.registry(outputs)
@@ -867,6 +882,9 @@ def build_images(session):
     host = contexts[0]["Endpoints"]["docker"]["Host"]
     require(host.startswith(("unix:///", "npipe:////./pipe/")),
             "Only a local Docker Engine/Desktop socket is permitted; remote context refused.")
+    plugins = json.loads(command(
+        docker + ["info", "--format", "{{json .ClientInfo.Plugins}}"], env=session.env).stdout)
+    plugin_directory = buildx_plugin_directory(plugins)
     session.show_target()
     print(f"Build and PUSH BOTH linux/amd64 images to {registry}; source SHA256: {sha}")
     print(f"Repository-root context: {ROOT}")
@@ -875,6 +893,8 @@ def build_images(session):
     require(inputs == build_inputs(), "Source changed during approval; restart build-images.")
     folder = private_dir(ARTIFACTS / "builds" / uuid.uuid4().hex)
     config = private_dir(folder / "docker")
+    # Keep plugin discovery without copying the user's registry credentials.
+    write_json(config / "config.json", {"cliPluginsExtraDirs": [plugin_directory]})
     env = session.env.copy()
     for key in ("DOCKER_CONTEXT", "DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
                 "BUILDX_BUILDER", "BUILDX_CONFIG"):

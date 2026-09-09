@@ -604,6 +604,30 @@ class WorkloadPlanTests(unittest.TestCase):
                                      {"hosted_image": "approved", "web_image": "approved"})
 
 
+class BuildxPluginTests(unittest.TestCase):
+    def test_uses_installed_plugin_directory_without_global_configuration(self):
+        path = Path(__file__).resolve().parent / "docker-buildx"
+        with patch.object(Path, "is_file", return_value=True), patch.object(deploy.os, "access", return_value=True):
+            self.assertEqual(
+                deploy.buildx_plugin_directory([{"Name": "buildx", "Path": str(path)}]),
+                str(path.parent),
+            )
+
+    def test_rejects_missing_invalid_or_failed_plugin_metadata(self):
+        for plugins in (None, [None], [], [{"Name": "compose"}],
+                        [{"Name": "buildx", "Err": "unavailable"}],
+                        [{"Name": "buildx", "Path": "docker-buildx"}],
+                        [{"Name": "buildx", "Path": None}]):
+            with self.subTest(plugins=plugins), self.assertRaises(deploy.DeploymentError):
+                deploy.buildx_plugin_directory(plugins)
+
+    def test_rejects_nonexecutable_plugin(self):
+        path = Path(__file__).resolve().parent / "docker-buildx"
+        with patch.object(Path, "is_file", return_value=True), patch.object(deploy.os, "access", return_value=False):
+            with self.assertRaises(deploy.DeploymentError):
+                deploy.buildx_plugin_directory([{"Name": "buildx", "Path": str(path)}])
+
+
 class AzureRequestTests(unittest.TestCase):
     def test_audience_tokens_and_read_only_requests(self):
         session, _, _, _ = fixture()
