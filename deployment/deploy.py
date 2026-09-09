@@ -25,6 +25,10 @@ INFRA = ROOT / "infra"
 ARTIFACTS = ROOT / "deployment" / ".artifacts"
 GUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+PROJECT_SEARCH_ROLES = {
+    "project_search_data": "8ebe5a00-799e-43f5-93ac-243d3dce84a7",
+    "project_search_service": "7ca78c08-252a-4471-8644-bb5ff32d4ba0",
+}
 DOCKERIGNORE = """**
 !pyproject.toml
 !uv.lock
@@ -189,6 +193,25 @@ SEPARATELY EXECUTED FLOW (append --environment ENV --tfvars PATH to each)
      identity may be null and is NEVER inferred or replaced by project identity.
      Then GETs public ui_url/health, if available. Empty Search index requires
      separately approved manual public-document ingestion.
+
+RESTRICTED PROJECT SEARCH RBAC REPAIR (not part of normal workload deployment)
+  plan-project-search-rbac --environment ENV --tfvars PATH
+    Preparation ONLY. Preserves deploy_workloads=true and pins BOTH images from
+    applied resource bodies, ignoring current build provenance/unapplied images.
+    Authenticated ARM GETs bind the applied project's managed identity and the
+    existing Search service to the requested subscription.
+    Permits exactly two CREATEs: module.access.azapi_resource.assignment keys
+    project_search_data (Search Index Data Contributor) and
+    project_search_service (Search Service Contributor), at that Search scope
+    for that project identity only. No updates, deletes, image/config changes,
+    imports, state moves, hosted/UI grants, or extra resources can be bundled.
+    Saves the actual binary, private plan text, approval context and SHA256.
+  apply --stage project-search-rbac --plan deployment/.artifacts/plans/PLAN/plan.bin
+    A separate terminal APPROVE <sha256> is still required. Rechecks exact plan,
+    inputs, applied-state/images hash and authoritative ARM principal/scope.
+    Planning does NOT authorize apply. Never set deploy_workloads=false to repair
+    RBAC on an existing deployment. Normal workload/foundation guards remain.
+  https://learn.microsoft.com/azure/foundry/agents/how-to/tools/ai-search#troubleshooting
 
 SECURITY / COST
   Hosted containers use the current Responses protocol 2.0.0 and the current
@@ -714,14 +737,113 @@ def workload_foundation_guard(plan):
                 "then create a fresh workload plan. No automatic migration or apply is allowed.")
 
 
-def validate_plan(session, plan, stage, images=None):
+def project_search_rbac_context(session):
+    values = session.state()
+    outputs = {key: item["value"] for key, item in values.get("outputs", {}).items()}
+    require(outputs.get("deploy_workloads") is True,
+            "Project Search RBAC repair requires existing workloads; never disable them to repair RBAC.")
+    project = project_target(outputs, session.target)
+    resources = state_resources(values)
+    project_state = resources.get("module.foundry.azapi_resource.project", {}).get("values", {})
+    principal = outputs.get("project_principal_id")
+    require(isinstance(principal, str) and GUID.fullmatch(principal.lower())
+            and project_state.get("id") == project["project_id"]
+            and any(identity.get("principal_id", "").lower() == principal.lower()
+                    for identity in project_state.get("identity", []) if isinstance(identity, dict)),
+            "Applied project principal/resource binding is missing or inconsistent.")
+    remote_project = confirm_project(session, project)
+    require((remote_project.get("identity") or {}).get("principalId", "").lower() == principal.lower(),
+            "Authoritative ARM project identity differs from applied state.")
+    scope = outputs.get("search_service_id")
+    require(isinstance(scope, str) and re.fullmatch(
+        r"/subscriptions/" + re.escape(session.target["subscription_id"])
+        + r"/resourceGroups/[a-zA-Z0-9_.()-]+/providers/Microsoft\.Search/searchServices/[a-zA-Z0-9-]+",
+        scope, re.I), "Search RBAC scope must be a service in the requested subscription.")
+    search_state = resources.get("module.search.azapi_resource.service", {}).get("values", {})
+    require(search_state.get("id") == scope, "Search scope does not match applied service state.")
+    remote_search = azure_request(session, "https://management.azure.com" + scope + "?api-version=2025-05-01",
+                                  "https://management.azure.com/")
+    require(isinstance(remote_search.get("id"), str) and remote_search["id"].lower() == scope.lower(),
+            "Authoritative ARM Search resource differs from the approved scope.")
+    _, registry = session.registry(outputs)
+    hosted = resources.get("module.workloads[0].azapi_data_plane_resource.hosted", {}).get("values", {})
+    web = resources.get("module.workloads[0].azapi_resource.web", {}).get("values", {})
+    containers = web.get("body", {}).get("properties", {}).get("template", {}).get("containers", [])
+    require(len(containers) == 1 and containers[0].get("name") == "web",
+            "Expected one applied UI container; refusing to infer an image.")
+    images = {
+        "hosted_image": hosted.get("body", {}).get("definition", {}).get("container_configuration", {}).get("image"),
+        "web_image": containers[0].get("image"),
+    }
+    for kind, image in images.items():
+        require(isinstance(image, str) and re.fullmatch(
+            re.escape(registry) + r"/search-" + kind.split("_")[0] + r"@sha256:[0-9a-f]{64}", image),
+            "RBAC repair requires actual applied workload image digests in the shared ACR.")
+    return {**project, "principal_id": principal, "search_id": scope, "images": images,
+            "state_sha256": source_hash(values)}
+
+
+def project_search_rbac_guard(session, plan, context):
+    require(isinstance(context, dict), "Missing authenticated project Search RBAC approval context.")
+    prior = plan.get("prior_state", {}).get("values", {}).get("outputs", {})
+    for output, expected in (
+        ("deploy_workloads", True), ("project_id", context["project_id"]),
+        ("project_principal_id", context["principal_id"]), ("search_service_id", context["search_id"]),
+    ):
+        require(prior.get(output, {}).get("value") == expected,
+                "Saved RBAC plan prior state differs from the authenticated applied target.")
+    allowed = {f'module.access.azapi_resource.assignment["{key}"]': role
+               for key, role in PROJECT_SEARCH_ROLES.items()}
+    seen = set()
+    for resource in plan.get("resource_changes", []):
+        change = resource.get("change", {})
+        actions = change.get("actions")
+        if actions == ["no-op"] or (resource.get("mode") == "data" and actions == ["read"]):
+            require(not change.get("importing") and not resource.get("previous_address"),
+                    "RBAC repair cannot import or move resources.")
+            continue
+        address = resource.get("address")
+        require(address in allowed and address not in seen and resource.get("mode") == "managed"
+                and resource.get("type") == "azapi_resource" and actions == ["create"]
+                and change.get("before") is None and not change.get("importing")
+                and not resource.get("previous_address"),
+                "RBAC repair permits only CREATE of the two project Search role assignments; "
+                "all other creates, updates, deletes, replacements, imports and moves are refused.")
+        role = allowed[address]
+        after = change.get("after") or {}
+        expected_name = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                            f"{context['search_id']}/{context['principal_id']}/{role}".lower()))
+        properties = {
+            "principalId": context["principal_id"],
+            "principalType": "ServicePrincipal",
+            "roleDefinitionId": (f"/subscriptions/{session.target['subscription_id']}"
+                                 f"/providers/Microsoft.Authorization/roleDefinitions/{role}"),
+        }
+        require(after.get("type") == "Microsoft.Authorization/roleAssignments@2022-04-01"
+                and after.get("parent_id") == context["search_id"]
+                and after.get("name") == expected_name
+                and after.get("body") == {"properties": properties},
+                "RBAC assignment does not exactly match approved project principal, role, Search scope and name.")
+        unknown = change.get("after_unknown", {})
+        require(not any(unknown.get(key) for key in ("type", "parent_id", "name", "body", "sensitive_body"))
+                and not after.get("sensitive_body") and not after.get("sensitive_body_version")
+                and not after.get("create_headers") and not after.get("create_query_parameters"),
+                "Unknown/hidden RBAC request fields or create overrides cannot be approved.")
+        seen.add(address)
+    require(seen == set(allowed), "RBAC repair must create exactly both missing project Search assignments.")
+    require(all(change.get("actions") == ["no-op"]
+                for change in plan.get("output_changes", {}).values()),
+            "RBAC repair cannot bundle output changes; refresh/review state separately.")
+
+
+def validate_plan(session, plan, stage, images=None, rbac_context=None):
     require(plan.get("errored") is not True and plan.get("applyable") is not False,
             "The saved plan is not applicable.")
     require(changes_present(plan), "Empty plan: nothing to approve or apply.")
     variables = {k: v.get("value") for k, v in plan.get("variables", {}).items()}
     for key, value in session.target.items():
         require(variables.get(key) == value, f"Saved plan target mismatch: {key}")
-    require(variables.get("deploy_workloads") is (stage == "workloads"), "Saved plan stage mismatch.")
+    require(variables.get("deploy_workloads") is (stage != "foundation"), "Saved plan stage mismatch.")
     prior_values = plan.get("prior_state", {}).get("values", {})
     prior = prior_values.get("outputs", {})
     if stage == "foundation":
@@ -729,11 +851,14 @@ def validate_plan(session, plan, stage, images=None):
                          state_has_resources(prior_values))
     else:
         require(images is not None, "Workloads plan requires verified image provenance.")
-        workload_foundation_guard(plan)
+        if stage == "project-search-rbac":
+            project_search_rbac_guard(session, plan, rbac_context)
+        else:
+            workload_foundation_guard(plan)
         for key, value in images.items():
             require(variables.get(key) == value, "Saved plan image differs from approved build.")
     planned = plan.get("planned_values", {}).get("outputs", {}).get("deploy_workloads", {})
-    require(planned.get("value") is (stage == "workloads"),
+    require(planned.get("value") is (stage != "foundation"),
             "Root must output deploy_workloads with the planned stage value.")
     modules = [plan.get("planned_values", {}).get("root_module", {})]
     while modules:
@@ -768,8 +893,12 @@ def show_plan(session, binary):
 def plan_stage(session, stage):
     outputs = session.outputs()
     images, provenance = (None, None)
+    rbac_context = None
     if stage == "foundation":
         session.foundation_safe(outputs)
+    elif stage == "project-search-rbac":
+        rbac_context = project_search_rbac_context(session)
+        images = rbac_context["images"]
     else:
         images, provenance = image_inputs(session, outputs)
         permission_readiness(session, timeout=getattr(session.args, "timeout", 600))
@@ -777,23 +906,28 @@ def plan_stage(session, stage):
     tfvars_hash = digest(session.tfvars.read_bytes())
     folder = private_dir(ARTIFACTS / "plans" / f"{stage}-{uuid.uuid4().hex}")
     binary = folder / "plan.bin"
-    values = {**session.target, "deploy_workloads": stage == "workloads"}
+    values = {**session.target, "deploy_workloads": stage != "foundation"}
     if stage == "foundation":
         values.update(hosted_image=None, web_image=None)
+    elif stage == "project-search-rbac":
+        values.update(images)
     overrides = folder / "stage.tfvars.json"
     write_json(overrides, values)
     args = ["plan", "-input=false", "-no-color", "-lock-timeout=60s",
             "-detailed-exitcode", f"-var-file={session.tfvars}"]
-    if images:
+    if images and stage != "project-search-rbac":
         args.append(f"-var-file={ARTIFACTS / 'images.tfvars.json'}")
     args += [f"-var-file={overrides}", f"-out={binary}"]
     session.tf(*args, log=folder / "plan.log", accepted=(0, 2))
     regular(binary).chmod(0o600)
     plan, text = show_plan(session, binary)
-    validate_plan(session, plan, stage, images)
+    validate_plan(session, plan, stage, images, rbac_context=rbac_context)
     require(inputs == infra_inputs() and tfvars_hash == digest(session.tfvars.read_bytes()),
             "Inputs changed during planning; discard this plan and explicitly plan again.")
-    if images:
+    if rbac_context:
+        require(project_search_rbac_context(session) == rbac_context,
+                "Authenticated RBAC target or applied image/state changed during planning; discard the plan.")
+    elif images:
         require(image_inputs(session, session.outputs()) == (images, provenance),
                 "Image provenance changed during planning.")
     sha = digest(binary.read_bytes())
@@ -802,6 +936,7 @@ def plan_stage(session, stage):
         "sha256": sha, "stage": stage, "binding": session.binding(),
         "tfvars_sha256": tfvars_hash, "infra_inputs": inputs,
         "images": images, "provenance": provenance,
+        "rbac_context": rbac_context,
     })
     session.show_target()
     print(text.decode("utf-8", errors="replace"))
@@ -822,10 +957,16 @@ def apply_stage(session):
     if stage == "foundation":
         session.foundation_safe(outputs)
     images = None
+    rbac_context = None
     if stage == "workloads":
         images, provenance = image_inputs(session, outputs)
         require(images == record["images"] and provenance == record["provenance"],
                 "Saved plan does not match current approved image provenance.")
+    elif stage == "project-search-rbac":
+        rbac_context = project_search_rbac_context(session)
+        images = rbac_context["images"]
+        require(rbac_context == record.get("rbac_context") and images == record["images"],
+                "Applied state/images or authenticated RBAC target changed; create a fresh RBAC plan.")
 
     def unchanged():
         session.initialized()
@@ -835,10 +976,13 @@ def apply_stage(session):
         if stage == "workloads":
             require(image_inputs(session, outputs) == (record["images"], record["provenance"]),
                     "Image inputs changed after plan approval.")
+        elif stage == "project-search-rbac":
+            require(source_hash(session.state()) == rbac_context["state_sha256"],
+                    "Applied state changed after RBAC plan approval; create a fresh plan.")
 
     unchanged()
     plan, text = show_plan(session, binary)
-    validate_plan(session, plan, stage, images)
+    validate_plan(session, plan, stage, images, rbac_context=rbac_context)
     unchanged()
     session.show_target()
     print(text.decode("utf-8", errors="replace"))
@@ -848,6 +992,10 @@ def apply_stage(session):
     unchanged()
     if stage == "foundation":
         session.foundation_safe(session.outputs())
+    elif stage == "project-search-rbac":
+        require(project_search_rbac_context(session) == rbac_context,
+                "Authenticated RBAC scope/principal changed after approval; no apply performed.")
+        unchanged()
     else:
         permission_readiness(session, timeout=getattr(session.args, "timeout", 600))
         unchanged()
@@ -988,6 +1136,7 @@ def confirm_project(session, target, timeout=30):
     require(endpoint is not None and project_target(
         {"project_id": bound["project_id"], "project_endpoint": endpoint}, session.target) == bound,
         "State endpoint does not belong to the authoritative ARM project.")
+    return project
 
 
 def routing_targets(outputs, target):
@@ -1453,6 +1602,8 @@ def parser():
         ("apply", "Show and separately approve one exact saved binary plan."),
         ("build-images", "Separately approve local linux/amd64 image build and ACR push."),
         ("plan-workloads", "Explicitly plan workloads with verified actual image digests."),
+        ("plan-project-search-rbac", "Plan ONLY the two project-MI Search role creates. "
+         "Preserves workloads and applied images; authenticated ARM checks; never apply."),
         ("route-agents", "Separately approved non-provisioner routing of existing agents only. "
          "Requires both versions active (otherwise wait/retry). Shows private SHA256-bound diffs; "
          "terminal ROUTE <sha256> approves PATCH, not Terraform apply. Then run verify."),
@@ -1466,7 +1617,7 @@ def parser():
             backend.add_argument("--local-development", action="store_true")
             backend.add_argument("--backend-config", help="Private existing azurerm backend config path.")
         if name == "apply":
-            sub.add_argument("--stage", choices=("foundation", "workloads"), required=True)
+            sub.add_argument("--stage", choices=("foundation", "workloads", "project-search-rbac"), required=True)
             sub.add_argument("--plan", required=True, help="Saved deployment/.artifacts/plans/.../plan.bin.")
         if name in ("verify", "plan-workloads", "apply"):
             sub.add_argument("--timeout", type=int, default=600, help="Readiness deadline in seconds (1..3600).")
@@ -1487,6 +1638,8 @@ def main(argv=None):
             plan_stage(session, "foundation")
         elif args.command == "plan-workloads":
             plan_stage(session, "workloads")
+        elif args.command == "plan-project-search-rbac":
+            plan_stage(session, "project-search-rbac")
         elif args.command == "apply":
             apply_stage(session)
         elif args.command == "build-images":

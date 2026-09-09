@@ -13,10 +13,10 @@ locals {
     search_service_contributor = "7ca78c08-252a-4471-8644-bb5ff32d4ba0"
   }
 
-  # Follow the explicit native-tool setup instructions: account system identity,
-  # Search Index Data Contributor + Search Service Contributor. This is broader
-  # than query-only access; reader-only is not verified for the complete tool.
-  # Do not copy these grants onto the project, UI, or hosted instance identities.
+  # Retain the account identity grants from the native-tool setup instructions.
+  # The same guide's 401/403 troubleshooting explicitly requires both roles on
+  # the project identity; add that pair without granting UI/hosted identities.
+  # https://learn.microsoft.com/azure/foundry/agents/how-to/tools/ai-search#troubleshooting
   # Hosted code authenticates with its separate platform-created instance identity.
   # Project-endpoint inference is implicit for that identity; the project MI below
   # authorizes the proxy to the account deployment and pulls the hosted image.
@@ -51,6 +51,16 @@ locals {
       principal_id = var.project_principal_id
       role_id      = local.role_ids.foundry_user
       scope        = var.account_id
+    }
+    project_search_data = {
+      principal_id = var.project_principal_id
+      role_id      = local.role_ids.search_data_contributor
+      scope        = var.search_id
+    }
+    project_search_service = {
+      principal_id = var.project_principal_id
+      role_id      = local.role_ids.search_service_contributor
+      scope        = var.search_id
     }
     ui_acr_pull = {
       principal_id = var.ui_principal_id
