@@ -43,7 +43,9 @@ async def test_parallel_fanout_and_independent_failure(raw_response):
     assert "secret-credential" not in json.dumps(result)
     for client in clients.values():
         kwargs = client.responses.create.call_args.kwargs
-        assert kwargs["reasoning"] == {"effort": "low"}
+        assert "reasoning" not in kwargs
+        assert kwargs["max_output_tokens"] == 4096
+        assert kwargs["include"] == ["reasoning.encrypted_content"]
         assert kwargs["extra_headers"]["x-client-comparison-id"] == "comparison-1"
 
 

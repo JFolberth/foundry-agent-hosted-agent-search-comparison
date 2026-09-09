@@ -175,7 +175,7 @@ def extract_evidence(raw: dict, *, hosted: bool = False) -> dict:
 def error_result(message: str) -> dict:
     result = extract_evidence({})
     result.update(
-        error=message, latency_ms=None, continuation=None, trace_id=None, span_id=None,
+        error=message, error_diagnostics=None, latency_ms=None, continuation=None, trace_id=None, span_id=None,
         conversation_id=None, conversation_note="No provider conversation ID is available.",
         hosted_runtime_trace_id=None, hosted_runtime_span_id=None,
         hosted_runtime_telemetry_note="No hosted runtime telemetry IDs were returned.",

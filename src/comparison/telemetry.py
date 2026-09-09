@@ -3,11 +3,13 @@ import logging
 
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
+from .diagnostics import configure_safe_logging
 
 tracer = trace.get_tracer("comparison")
 
 
 def configure_telemetry(service: str):
+    configure_safe_logging()
     # No content instrumentation or SDK console logging, even if inherited from the host.
     os.environ["AZURE_AI_PROJECTS_CONSOLE_LOGGING"] = "false"
     os.environ["AZURE_TRACING_GEN_AI_CONTENT_RECORDING_ENABLED"] = "false"

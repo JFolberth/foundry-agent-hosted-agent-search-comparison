@@ -17,6 +17,7 @@ from starlette.routing import Route
 from comparison.clients import open_clients
 from comparison.config import Settings, load_config, model_options
 from comparison.contracts import MAX_RAW_BYTES, MAX_RAW_ITEMS, MAX_TURNS, MODEL_TIMEOUT
+from comparison.diagnostics import failure, from_metadata, http_status, record_failure, response_request_id, to_metadata
 from comparison.evidence import extract_evidence, response_identifier
 from comparison.guard import HostedRequestGuard, RequestGuard
 from comparison.state import HistoryExpired, HistoryFull, HistoryStore, validate_raw
@@ -172,6 +173,10 @@ async def stream_response(client, settings, config, request, context, cancellati
     total_bytes = 0
     conversations = conversations if conversations is not None else HistoryStore()
     conversation_id = None
+    stage = "hosted.model.input"
+    diagnostic = None
+    upstream_status = None
+    upstream_request_id = None
     try:
         async with asyncio.timeout(MODEL_TIMEOUT):
             if request.get("conversation") or request.get("previous_response_id") or request.get("store") is True:
@@ -186,6 +191,7 @@ async def stream_response(client, settings, config, request, context, cancellati
             owner = f"hosted_model:{identity.user_id or '_local'}"
             token = context.client_headers.get("x-client-hosted-continuation")
             if token:
+                stage = "continuation"
                 if len(items) != 1:
                     raise ValueError("Do not resend history with a conversation continuation")
                 previous = conversations.take(token, owner)
@@ -195,6 +201,7 @@ async def stream_response(client, settings, config, request, context, cancellati
             else:
                 seed = items[:-1]
                 turns = sum(item.get("role") == "user" for item in seed)
+                stage = "hosted.model.conversations.create"
                 conversation = await interruptible(
                     client.conversations.create(items=seed, extra_headers=dict(headers)),
                     cancellation_signal, context.shutdown,
@@ -208,12 +215,18 @@ async def stream_response(client, settings, config, request, context, cancellati
                 raise HistoryFull()
             options = model_options(settings, config)
             options["conversation"] = conversation_id
+            stage = "hosted.model.responses.create"
             upstream = await interruptible(
                 client.responses.create(
                     input=[items[-1]], stream=True, extra_headers=dict(headers), **options,
                 ), cancellation_signal, context.shutdown, acquiring=True,
             )
             async with upstream:
+                response = getattr(upstream, "response", None)
+                if response is not None:
+                    upstream_status = http_status(getattr(response, "status_code", None))
+                    upstream_request_id = response_request_id(response)
+                stage = "hosted.model.stream"
                 iterator = upstream.__aiter__()
                 while True:
                     try:
@@ -260,6 +273,7 @@ async def stream_response(client, settings, config, request, context, cancellati
                     yield event
             if terminal is None:
                 raise InterruptedStream()
+            stage = "hosted.model.response.validate"
             output = terminal.get("output")
             if not isinstance(output, list):
                 raise InterruptedStream()
@@ -287,19 +301,31 @@ async def stream_response(client, settings, config, request, context, cancellati
                 envelope["metadata"]["hosted_model_continuation"] = conversations.put(
                     owner, [], turns + 1, conversation_id=conversation_id,
                 )
-    except HistoryExpired:
+            else:
+                diagnostic = failure(
+                    "hosted.model.stream",
+                    kind="UpstreamIncomplete" if envelope["status"] == "incomplete" else "UpstreamFailed",
+                    status=upstream_status, request=upstream_request_id,
+                )
+    except HistoryExpired as exc:
+        diagnostic = failure(stage, exc)
         envelope.update(status="failed", error={"code": "conversation_expired", "message": "Hosted model continuation expired or was used. Reset to continue."})
-    except CancelledStream:
+    except CancelledStream as exc:
+        diagnostic = failure(stage, exc)
         envelope.update(status="cancelled", error={"code": "cancelled", "message": "Request cancelled."})
-    except (TimeoutError, InterruptedStream, HistoryFull):
+    except (TimeoutError, InterruptedStream, HistoryFull) as exc:
+        diagnostic = failure(stage, exc)
         envelope.update(
             status="incomplete", incomplete_details={"reason": "upstream_interrupted"},
             error={"code": "upstream_interrupted", "message": "Model stream or history limit interrupted the response."},
         )
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
+        diagnostic = failure(stage, exc)
         envelope.update(status="failed", error={"code": "server_error", "message": "Hosted model request failed."})
+    if diagnostic:
+        envelope.setdefault("metadata", {}).update(to_metadata(diagnostic))
     if terminal is None or envelope["status"] not in ("completed", "incomplete", "failed", "cancelled"):
         envelope["output"] = [done_items.get(i, seen[i]) for i in sorted(seen)]
     elif "output" not in envelope or not envelope["output"]:
@@ -350,22 +376,29 @@ def create_app(client=None, settings=None, store=None):
             record_exception=False, set_status_on_exception=False,
             attributes={"comparison.id": comparison_id, "comparison.side": "hosted"},
         ) as span:
-            async for event in stream_response(
-                runtime["client"], runtime["settings"], config, request, context, cancellation_signal,
-                runtime["conversations"],
-            ):
-                if event["type"] in ("response.completed", "response.failed", "response.incomplete"):
-                    ids = telemetry_ids()
-                    metadata = event["response"].setdefault("metadata", {})
-                    for key in ("trace_id", "span_id"):
-                        if ids[key]:
-                            metadata[f"hosted_runtime_{key}"] = ids[key]
-                    if metadata.get("hosted_model_conversation_id"):
-                        span.set_attribute("gen_ai.conversation.id", metadata["hosted_model_conversation_id"])
-                    model_evidence = extract_evidence(event["response"], hosted=True)
-                    model_evidence["response_id"] = model_evidence["model_response_id"]
-                    record_evidence(span, model_evidence, comparison_id)
-                yield event
+            try:
+                async for event in stream_response(
+                    runtime["client"], runtime["settings"], config, request, context, cancellation_signal,
+                    runtime["conversations"],
+                ):
+                    if event["type"] in ("response.completed", "response.failed", "response.incomplete"):
+                        ids = telemetry_ids()
+                        metadata = event["response"].setdefault("metadata", {})
+                        for key in ("trace_id", "span_id"):
+                            if ids[key]:
+                                metadata[f"hosted_runtime_{key}"] = ids[key]
+                        if metadata.get("hosted_model_conversation_id"):
+                            span.set_attribute("gen_ai.conversation.id", metadata["hosted_model_conversation_id"])
+                        model_evidence = extract_evidence(event["response"], hosted=True)
+                        model_evidence["response_id"] = model_evidence["model_response_id"]
+                        record_evidence(span, model_evidence, comparison_id)
+                        if event["response"].get("status") != "completed":
+                            diagnostic = from_metadata(event["response"]) or failure("hosted.model.stream", kind="UpstreamFailed")
+                            record_failure(span, diagnostic, comparison_id)
+                    yield event
+            except asyncio.CancelledError as exc:
+                record_failure(span, failure("hosted.model.stream", exc), comparison_id)
+                raise
 
     host.add_middleware(HostedRequestGuard)
     host.add_middleware(RequestGuard, path="/responses", body_limit=MAX_RAW_BYTES, concurrent=8, per_minute=24)

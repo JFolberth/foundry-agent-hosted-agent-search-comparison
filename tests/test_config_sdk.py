@@ -51,7 +51,7 @@ async def test_real_sdk_serialization_and_dedicated_routes(settings, raw_respons
                 agent_name=name, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(transport)),
             ) as client:
                 options = model_options(settings, load_config()) if name is None else {
-                    "reasoning": {"effort": "low"}, "store": False,
+                    "max_output_tokens": 4096, "include": ["reasoning.encrypted_content"], "store": False,
                 }
                 response = await client.responses.create(input="Question", **options)
                 # The real installed OpenAI SDK retains unknown native extension fields.

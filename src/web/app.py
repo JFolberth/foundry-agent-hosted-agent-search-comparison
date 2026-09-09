@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from opentelemetry.trace import Status, StatusCode
 
 from comparison.clients import open_clients
 from comparison.cancellation import while_connected
@@ -98,10 +99,16 @@ def create_app(service=None):
         with tracer.start_as_current_span(
             "comparison", record_exception=False, set_status_on_exception=False,
             attributes={"comparison.id": comparison_id},
-        ):
-            results = await while_connected(
-                app.state.service.compare(request, comparison_id), connection.is_disconnected,
-            )
+        ) as span:
+            try:
+                results = await while_connected(
+                    app.state.service.compare(request, comparison_id), connection.is_disconnected,
+                )
+            except BaseException:
+                span.set_status(Status(StatusCode.ERROR))
+                raise
+            if any(result.get("error") is not None for result in results.values()):
+                span.set_status(Status(StatusCode.ERROR))
         return {"comparison_id": comparison_id, "reasoning_effort": config.reasoning_effort, **results}
 
     static = ROOT / "src/web/static"

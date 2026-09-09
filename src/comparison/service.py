@@ -5,6 +5,7 @@ import time
 from opentelemetry.propagate import inject
 
 from .contracts import CompareRequest, MAX_TURNS, REQUEST_TIMEOUT
+from .diagnostics import failure, from_metadata, record_failure
 from .evidence import error_result, extract_evidence
 from .state import HistoryExpired, HistoryFull, HistoryStore, validate_raw
 from .telemetry import record_evidence, telemetry_ids, tracer
@@ -55,6 +56,8 @@ class ComparisonService:
     async def _one(self, side, request, comparison_id):
         started = time.perf_counter()
         conversation_id = None
+        stage = "request.validate"
+        diagnostic = None
         with tracer.start_as_current_span(
             f"agent.{side}", record_exception=False, set_status_on_exception=False,
             attributes={"comparison.id": comparison_id, "comparison.side": side},
@@ -64,6 +67,7 @@ class ComparisonService:
                 hosted_token = None
                 seed = []
                 if token:
+                    stage = "continuation"
                     # A Foundry conversation is mutable. Consuming the capability
                     # before awaiting prevents concurrent reuse and stale replay.
                     snapshot = self.store.take(token, side)
@@ -86,6 +90,7 @@ class ComparisonService:
                     headers["x-client-traceparent"] = carrier["traceparent"]
                 async with asyncio.timeout(self.timeout):
                     if side == "prompt" and conversation_id is None:
+                        stage = "prompt.conversations.create"
                         try:
                             conversation = await self.clients[side].conversations.create(
                                 items=seed, extra_headers=dict(headers),
@@ -98,13 +103,14 @@ class ComparisonService:
                     if hosted_token:
                         headers["x-client-hosted-continuation"] = hosted_token
                     invocation = {"conversation": conversation_id} if side == "prompt" else {}
+                    stage = f"{side}.responses.create"
                     response = await self.clients[side].responses.create(
                         input=(seed if side == "hosted" else []) + [{"role": "user", "content": request.message}],
-                        reasoning={"effort": self.config.reasoning_effort},
                         max_output_tokens=self.config.max_output_tokens,
                         include=["reasoning.encrypted_content"],
                         store=side == "prompt", stream=False, extra_headers=dict(headers), **invocation,
                     )
+                stage = f"{side}.response.parse"
                 raw = response.model_dump(mode="json", exclude_unset=True, warnings=False)
                 next_hosted_token = None
                 if side == "hosted":
@@ -126,6 +132,12 @@ class ComparisonService:
                     if raw.get("status") != "completed":
                         result["error"] = "Agent response was incomplete or failed. Reset this conversation before retrying."
                         result["continuation"] = None
+                        diagnostic = (
+                            from_metadata(raw) if side == "hosted" else None
+                        ) or failure(
+                            stage, kind="UpstreamIncomplete" if raw.get("status") == "incomplete" else "UpstreamFailed",
+                            request=getattr(response, "_request_id", None),
+                        )
                     elif conversation_id is None or (side == "hosted" and next_hosted_token is None):
                         result["error"] = "Agent did not return a usable provider conversation continuation. Reset to continue."
                         result["continuation"] = None
@@ -134,17 +146,25 @@ class ComparisonService:
                             side, [], turns + 1, conversation_id=conversation_id, provider_token=next_hosted_token,
                         )
                 record_evidence(span, result, comparison_id)
-            except ConversationUnavailable:
+            except ConversationUnavailable as exc:
+                diagnostic = failure(stage, exc.__cause__ if exc.__cause__ is not None else exc)
                 result = error_result(
                     "Could not create a Foundry conversation on this agent route. Check API support and permissions."
                 )
-            except HistoryExpired:
+            except HistoryExpired as exc:
+                diagnostic = failure(stage, exc)
                 result = error_result("Conversation expired, was already used, or belongs to another side. Reset to continue.")
-            except HistoryFull:
+            except HistoryFull as exc:
+                diagnostic = failure(stage, exc)
                 result = error_result("Conversation limit reached. Reset to continue.")
-            except TimeoutError:
+            except TimeoutError as exc:
+                diagnostic = failure(stage, exc)
                 result = error_result("Agent timed out. Reset this conversation before retrying.")
-            except Exception:
+            except asyncio.CancelledError as exc:
+                record_failure(span, failure(stage, exc), comparison_id)
+                raise
+            except Exception as exc:
+                diagnostic = failure(stage, exc)
                 result = error_result("Agent request failed. Reset this conversation and check the comparison trace.")
             result["conversation_id"] = conversation_id
             result["conversation_scope"] = "hosted_model" if side == "hosted" else "agent"
@@ -156,6 +176,11 @@ class ComparisonService:
                 if conversation_id else "No provider conversation ID is available; none was fabricated."
             )
             result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+            result["error_diagnostics"] = None
+            if result["error"] is not None:
+                diagnostic = diagnostic or failure(stage, kind="ValueError")
+                result["error_diagnostics"] = diagnostic
+                record_failure(span, diagnostic, comparison_id)
             result.update(telemetry_ids())
             span.set_attribute("comparison.success", result["error"] is None)
             return result
