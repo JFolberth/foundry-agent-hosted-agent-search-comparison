@@ -47,16 +47,8 @@ def raw_response():
 
 
 def fake_client(raw):
-    hosted_id = f"conv_hosted_model_{next(_conversations)}"
     async def respond(**kwargs):
-        data = copy.deepcopy(raw)
-        if not kwargs.get("store"):
-            data.setdefault("metadata", {}).update(
-                hosted_model_conversation_id=hosted_id,
-                hosted_model_continuation="h" * 43,
-                conversation_scope="hosted_model",
-            )
-        return SimpleNamespace(model_dump=lambda **kwargs: data)
+        return SimpleNamespace(model_dump=lambda **kwargs: copy.deepcopy(raw))
     return SimpleNamespace(
         responses=SimpleNamespace(create=AsyncMock(side_effect=respond)),
         conversations=SimpleNamespace(create=AsyncMock(

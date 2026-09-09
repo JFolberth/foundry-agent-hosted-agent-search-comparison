@@ -63,18 +63,20 @@ async def test_private_continuations_use_actual_provider_conversations(raw_respo
     for side, client in clients.items():
         items = client.responses.create.call_args.kwargs["input"]
         assert len(items) == 1
-        assert "previous_response_id" not in client.responses.create.call_args.kwargs
         args = client.responses.create.call_args.kwargs
         if side == "prompt":
+            assert "previous_response_id" not in args
             assert args["conversation"] == first[side]["conversation_id"]
             assert args["store"] is True
             client.conversations.create.assert_awaited_once()
         else:
             assert "conversation" not in args
-            assert args["store"] is False
-            assert args["extra_headers"]["x-client-hosted-continuation"] == "h" * 43
+            assert args["store"] is True
+            assert args["previous_response_id"] == first[side]["response_id"]
+            assert "x-client-hosted-continuation" not in args["extra_headers"]
             client.conversations.create.assert_not_awaited()
-            assert first[side]["conversation_scope"] == "hosted_model"
+            assert first[side]["conversation_scope"] == "hosted_agent"
+            assert first[side]["conversation_id"] is None
         assert items[-1] == {"role": "user", "content": "Second"}
     swapped = await service.compare(
         CompareRequest(message="Wrong", continuation={"prompt": second["hosted"]["continuation"]}), "comparison-3",

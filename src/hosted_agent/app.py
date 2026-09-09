@@ -2,13 +2,12 @@ import asyncio
 import copy
 import json
 import os
-import re
 from contextlib import AsyncExitStack, asynccontextmanager
 from uuid import UUID, uuid4
 
 from azure.ai.agentserver.core import get_request_context
 from azure.ai.agentserver.responses import (
-    CreateResponse, InMemoryResponseProvider, ResponseContext, ResponsesAgentServerHost, ResponsesServerOptions,
+    CreateResponse, ResponseContext, ResponsesAgentServerHost, ResponsesServerOptions,
 )
 from opentelemetry.propagate import extract
 from starlette.responses import JSONResponse
@@ -20,7 +19,7 @@ from comparison.contracts import MAX_RAW_BYTES, MAX_RAW_ITEMS, MAX_TURNS, MODEL_
 from comparison.diagnostics import failure, from_metadata, http_status, record_failure, response_request_id, to_metadata
 from comparison.evidence import extract_evidence, response_identifier
 from comparison.guard import HostedRequestGuard, RequestGuard
-from comparison.state import HistoryExpired, HistoryFull, HistoryStore, validate_raw
+from comparison.state import HistoryExpired, HistoryFull, validate_raw
 from comparison.telemetry import configure_telemetry, record_evidence, telemetry_ids, tracer
 
 
@@ -157,13 +156,17 @@ def accumulate_partial(items, event):
 def snapshot(request, context, settings):
     result = {
         "id": context.response_id, "object": "response", "status": "in_progress",
-        "model": settings.model_deployment, "output": [], "store": False,
+        "model": settings.model_deployment, "output": [], "store": request.get("store", True),
         "created_at": int(context.created_at.timestamp()),
     }
+    if request.get("previous_response_id"):
+        result["previous_response_id"] = request["previous_response_id"]
+    if context.conversation_id:
+        result["conversation"] = {"id": context.conversation_id}
     return result
 
 
-async def stream_response(client, settings, config, request, context, cancellation_signal, conversations=None):
+async def stream_response(client, settings, config, request, context, cancellation_signal):
     """Released SDK sample_10 pattern: our lifecycle, native upstream content events."""
     envelope = snapshot(request, context, settings)
     yield {"type": "response.created", "response": copy.deepcopy(envelope)}
@@ -171,54 +174,27 @@ async def stream_response(client, settings, config, request, context, cancellati
     seen, done_items = {}, {}
     terminal = None
     total_bytes = 0
-    conversations = conversations if conversations is not None else HistoryStore()
-    conversation_id = None
     stage = "hosted.model.input"
     diagnostic = None
     upstream_status = None
     upstream_request_id = None
     try:
         async with asyncio.timeout(MODEL_TIMEOUT):
-            if request.get("conversation") or request.get("previous_response_id") or request.get("store") is True:
-                raise ValueError("Outer hosted requests are stateless")
+            history = await interruptible(context.get_history(), cancellation_signal, context.shutdown)
+            if request.get("previous_response_id") and not history:
+                raise HistoryExpired()
             current = await interruptible(context.get_input_items(), cancellation_signal, context.shutdown)
-            items = inline_items(current)
+            items = inline_items([*history, *current])
             if not items or items[-1].get("role") != "user":
                 raise ValueError("A current user message is required")
             headers = {"x-client-comparison-id": correlation_id(context.client_headers)}
             identity = get_request_context()
             headers.update(identity.platform_headers())
-            owner = f"hosted_model:{identity.user_id or '_local'}"
-            token = context.client_headers.get("x-client-hosted-continuation")
-            if token:
-                stage = "continuation"
-                if len(items) != 1:
-                    raise ValueError("Do not resend history with a conversation continuation")
-                previous = conversations.take(token, owner)
-                conversation_id, turns = previous.conversation_id, previous.turns
-                if not conversation_id:
-                    raise HistoryExpired()
-            else:
-                seed = items[:-1]
-                turns = sum(item.get("role") == "user" for item in seed)
-                stage = "hosted.model.conversations.create"
-                conversation = await interruptible(
-                    client.conversations.create(items=seed, extra_headers=dict(headers)),
-                    cancellation_signal, context.shutdown,
-                )
-                conversation_id = getattr(conversation, "id", None)
-                if not isinstance(conversation_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", conversation_id):
-                    conversation_id = None
-                    raise ValueError("Model conversation creation did not return a provider ID")
-            envelope["metadata"] = {"hosted_model_conversation_id": conversation_id, "conversation_scope": "hosted_model"}
-            if turns >= MAX_TURNS:
-                raise HistoryFull()
             options = model_options(settings, config)
-            options["conversation"] = conversation_id
             stage = "hosted.model.responses.create"
             upstream = await interruptible(
                 client.responses.create(
-                    input=[items[-1]], stream=True, extra_headers=dict(headers), **options,
+                    input=items, stream=True, extra_headers=dict(headers), **options,
                 ), cancellation_signal, context.shutdown, acquiring=True,
             )
             async with upstream:
@@ -248,10 +224,6 @@ async def stream_response(client, settings, config, request, context, cancellati
                             "response.failed": ("failed", "cancelled"),
                         }
                         if status not in expected[kind]:
-                            raise InterruptedStream()
-                        reported = terminal.get("conversation")
-                        reported = reported.get("id") if isinstance(reported, dict) else reported
-                        if reported is not None and reported != conversation_id:
                             raise InterruptedStream()
                         break
                     if kind in ("error", "response.error"):
@@ -296,20 +268,16 @@ async def stream_response(client, settings, config, request, context, cancellati
                     envelope[key] = value
             native_id = response_identifier(terminal.get("id"))
             if native_id is not None:
-                envelope["metadata"]["native_response_id"] = native_id
-            if envelope["status"] == "completed":
-                envelope["metadata"]["hosted_model_continuation"] = conversations.put(
-                    owner, [], turns + 1, conversation_id=conversation_id,
-                )
-            else:
+                envelope.setdefault("metadata", {})["native_response_id"] = native_id
+            if envelope["status"] != "completed":
                 diagnostic = failure(
                     "hosted.model.stream",
                     kind="UpstreamIncomplete" if envelope["status"] == "incomplete" else "UpstreamFailed",
                     status=upstream_status, request=upstream_request_id,
                 )
     except HistoryExpired as exc:
-        diagnostic = failure(stage, exc)
-        envelope.update(status="failed", error={"code": "conversation_expired", "message": "Hosted model continuation expired or was used. Reset to continue."})
+        diagnostic = failure("continuation", exc)
+        envelope.update(status="failed", error={"code": "conversation_expired", "message": "Hosted response history is unavailable. Reset to continue."})
     except CancelledStream as exc:
         diagnostic = failure(stage, exc)
         envelope.update(status="cancelled", error={"code": "cancelled", "message": "Request cancelled."})
@@ -336,7 +304,7 @@ async def stream_response(client, settings, config, request, context, cancellati
 
 def create_app(client=None, settings=None, store=None):
     config = load_config()
-    runtime = {"client": client, "settings": settings, "ready": client is not None, "conversations": HistoryStore()}
+    runtime = {"client": client, "settings": settings, "ready": client is not None}
 
     @asynccontextmanager
     async def lifespan(app):
@@ -361,7 +329,7 @@ def create_app(client=None, settings=None, store=None):
     os.environ.setdefault("AGENTSERVER_STATE_ROOT", ".runtime")
     host = ResponsesAgentServerHost(
         options=ResponsesServerOptions(default_fetch_history_count=MAX_RAW_ITEMS + 1),
-        store=store if store is not None else InMemoryResponseProvider(), configure_observability=None, access_log=None,
+        store=store, configure_observability=None, access_log=None,
         routes=[Route(path, health, methods=["GET"]) for path in ("/readiness", "/health", "/health/readiness")],
     )
     original_lifespan = host.router.lifespan_context
@@ -379,7 +347,6 @@ def create_app(client=None, settings=None, store=None):
             try:
                 async for event in stream_response(
                     runtime["client"], runtime["settings"], config, request, context, cancellation_signal,
-                    runtime["conversations"],
                 ):
                     if event["type"] in ("response.completed", "response.failed", "response.incomplete"):
                         ids = telemetry_ids()
@@ -387,8 +354,8 @@ def create_app(client=None, settings=None, store=None):
                         for key in ("trace_id", "span_id"):
                             if ids[key]:
                                 metadata[f"hosted_runtime_{key}"] = ids[key]
-                        if metadata.get("hosted_model_conversation_id"):
-                            span.set_attribute("gen_ai.conversation.id", metadata["hosted_model_conversation_id"])
+                        if context.conversation_id:
+                            span.set_attribute("gen_ai.conversation.id", context.conversation_id)
                         model_evidence = extract_evidence(event["response"], hosted=True)
                         model_evidence["response_id"] = model_evidence["model_response_id"]
                         record_evidence(span, model_evidence, comparison_id)

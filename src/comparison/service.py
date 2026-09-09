@@ -64,7 +64,7 @@ class ComparisonService:
         ) as span:
             try:
                 token = getattr(request.continuation, side)
-                hosted_token = None
+                hosted_response_id = None
                 seed = []
                 if token:
                     stage = "continuation"
@@ -72,10 +72,10 @@ class ComparisonService:
                     # before awaiting prevents concurrent reuse and stale replay.
                     snapshot = self.store.take(token, side)
                     conversation_id, turns = snapshot.conversation_id, snapshot.turns
-                    hosted_token = snapshot.provider_token
-                    if not conversation_id:
+                    hosted_response_id = snapshot.response_id
+                    if side == "prompt" and not conversation_id:
                         raise HistoryExpired()
-                    if side == "hosted" and not hosted_token:
+                    if side == "hosted" and not hosted_response_id:
                         raise HistoryExpired()
                 else:
                     seed = [m.model_dump() for m in getattr(request.history, side)]
@@ -100,30 +100,22 @@ class ComparisonService:
                         conversation_id = provider_id(conversation.id)
                         if conversation_id is None:
                             raise ConversationUnavailable()
-                    if hosted_token:
-                        headers["x-client-hosted-continuation"] = hosted_token
                     invocation = {"conversation": conversation_id} if side == "prompt" else {}
+                    if side == "hosted" and hosted_response_id:
+                        invocation["previous_response_id"] = hosted_response_id
                     stage = f"{side}.responses.create"
                     response = await self.clients[side].responses.create(
                         input=(seed if side == "hosted" else []) + [{"role": "user", "content": request.message}],
                         max_output_tokens=self.config.max_output_tokens,
                         include=["reasoning.encrypted_content"],
-                        store=side == "prompt", stream=False, extra_headers=dict(headers), **invocation,
+                        store=True, stream=False, extra_headers=dict(headers), **invocation,
                     )
                 stage = f"{side}.response.parse"
                 raw = response.model_dump(mode="json", exclude_unset=True, warnings=False)
-                next_hosted_token = None
-                if side == "hosted":
-                    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-                    reported = provider_id(metadata.get("hosted_model_conversation_id"))
-                    candidate = metadata.get("hosted_model_continuation")
-                    if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_-]{43}", candidate):
-                        next_hosted_token = candidate
-                    if conversation_id is None:
-                        conversation_id = reported
-                else:
-                    reported = raw.get("conversation")
-                    reported = reported.get("id") if isinstance(reported, dict) else reported
+                reported = raw.get("conversation")
+                reported = reported.get("id") if isinstance(reported, dict) else reported
+                if side == "hosted" and conversation_id is None:
+                    conversation_id = provider_id(reported)
                 if reported is not None and reported != conversation_id:
                     result = error_result("Agent returned a different conversation. Reset before continuing.")
                 else:
@@ -138,12 +130,15 @@ class ComparisonService:
                             stage, kind="UpstreamIncomplete" if raw.get("status") == "incomplete" else "UpstreamFailed",
                             request=getattr(response, "_request_id", None),
                         )
-                    elif conversation_id is None or (side == "hosted" and next_hosted_token is None):
+                    elif (side == "prompt" and conversation_id is None) or (
+                        side == "hosted" and result["response_id"] is None
+                    ):
                         result["error"] = "Agent did not return a usable provider conversation continuation. Reset to continue."
                         result["continuation"] = None
                     else:
                         result["continuation"] = self.store.put(
-                            side, [], turns + 1, conversation_id=conversation_id, provider_token=next_hosted_token,
+                            side, [], turns + 1, conversation_id=conversation_id,
+                            response_id=result["response_id"] if side == "hosted" else None,
                         )
                 record_evidence(span, result, comparison_id)
             except ConversationUnavailable as exc:
@@ -167,13 +162,16 @@ class ComparisonService:
                 diagnostic = failure(stage, exc)
                 result = error_result("Agent request failed. Reset this conversation and check the comparison trace.")
             result["conversation_id"] = conversation_id
-            result["conversation_scope"] = "hosted_model" if side == "hosted" else "agent"
+            result["conversation_scope"] = "hosted_agent" if side == "hosted" else "agent"
             if conversation_id:
                 span.set_attribute("gen_ai.conversation.id", conversation_id)
             result["conversation_note"] = (
-                ("Actual project-model conversation created inside the hosted container; not a hosted-endpoint conversation."
+                ("Actual hosted-endpoint conversation reported by the provider; history is platform-managed."
                  if side == "hosted" else "Actual agent-bound Foundry conversation; provider-managed history.")
-                if conversation_id else "No provider conversation ID is available; none was fabricated."
+                if conversation_id else (
+                    "Hosted history uses stored response IDs. No conversation ID was reported; no model conversation was created."
+                    if side == "hosted" else "No provider conversation ID is available; none was fabricated."
+                )
             )
             result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
             result["error_diagnostics"] = None

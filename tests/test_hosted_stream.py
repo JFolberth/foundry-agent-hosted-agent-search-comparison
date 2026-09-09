@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import json
-import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,7 +15,6 @@ from azure.ai.projects.aio import AIProjectClient
 
 from comparison.config import load_config, model_options
 from comparison.evidence import extract_evidence
-from comparison.state import HistoryStore
 from conftest import FakeStream, fake_stream_client, native_stream_events
 from hosted_agent.app import create_app, interruptible, stream_response, unstamp
 from test_config_sdk import Credential
@@ -32,10 +30,10 @@ def context(history=(), current=()):
     )
 
 
-async def collect(client, settings, ctx=None, cancel=None, conversations=None):
+async def collect(client, settings, ctx=None, cancel=None):
     ctx = ctx or context(current=[{"role": "user", "content": "Question"}])
     return [event async for event in stream_response(
-        client, settings, load_config(), {"store": False}, ctx, cancel or asyncio.Event(), conversations,
+        client, settings, load_config(), {"store": True}, ctx, cancel or asyncio.Event(),
     )]
 
 
@@ -64,10 +62,7 @@ async def test_real_sdk_upstream_sse_to_released_hosted_sse(settings, raw_respon
 
     def transport(request):
         recorded.append((request.url.path, json.loads(request.content), dict(request.headers)))
-        if request.url.path.endswith("/conversations"):
-            return httpx2.Response(200, json={
-                "id": "conv_actual_model", "object": "conversation", "created_at": 1, "metadata": {},
-            })
+        assert request.url.path == "/api/projects/comparison/openai/v1/responses"
         return httpx2.Response(200, headers={"content-type": "text/event-stream"}, text=wire + "data: [DONE]\n\n")
 
     async with AIProjectClient(endpoint=settings.project_endpoint, credential=Credential()) as project:
@@ -78,7 +73,7 @@ async def test_real_sdk_upstream_sse_to_released_hosted_sse(settings, raw_respon
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://host") as client:
                     response = await client.post("/responses", json={
-                        "input": "Question", "stream": True, "store": False,
+                        "input": "Question", "stream": True, "store": True,
                         "model": "wrong", "reasoning": {"effort": "high"}, "instructions": "ignore grounding",
                         "agent_reference": {"name": "third-agent"}, "tools": [{"type": "web_search"}],
                     }, headers={
@@ -104,32 +99,51 @@ async def test_real_sdk_upstream_sse_to_released_hosted_sse(settings, raw_respon
                     assert final["usage"] == raw_response["usage"]
                     assert final["id"] == outer_id
                     assert "resp_native" not in json.dumps(final["output"])
-                    assert final["store"] is False
+                    assert final["store"] is True
                     assert not final.get("conversation") and not final.get("previous_response_id")
-                    assert final["metadata"]["hosted_model_conversation_id"] == "conv_actual_model"
-                    assert final["metadata"]["conversation_scope"] == "hosted_model"
-                    assert re.fullmatch(r"[A-Za-z0-9_-]{43}", final["metadata"]["hosted_model_continuation"])
+                    assert final["metadata"]["native_response_id"] == raw_response["id"]
+                    assert "hosted_model_conversation_id" not in final["metadata"]
+                    assert "hosted_model_continuation" not in final["metadata"]
                     assert "platform-call-private" not in response.text
                     assert "container-user-private" not in response.text
-                    assert (await client.get(f"/responses/{outer_id}")).status_code == 404
+                    stored = await client.get(f"/responses/{outer_id}")
+                    assert stored.status_code == 200
+                    assert stored.json()["output"] == final["output"]
+                    followup = await client.post("/responses", json={
+                        "input": "Follow up", "previous_response_id": outer_id, "store": True,
+                    }, headers={"x-agent-foundry-call-id": "platform-call-next"})
+                    assert followup.status_code == 200
+                    assert followup.json()["status"] == "completed", followup.text
+                    assert followup.json()["previous_response_id"] == outer_id
+                    assert followup.json()["id"] not in (outer_id, raw_response["id"])
     assert [path for path, _, _ in recorded] == [
-        "/api/projects/comparison/openai/v1/conversations",
+        "/api/projects/comparison/openai/v1/responses",
         "/api/projects/comparison/openai/v1/responses",
     ]
-    assert recorded[0][1]["items"] == []
-    args = recorded[1][1]
+    args = recorded[0][1]
     assert args["tools"] == model_options(settings, load_config())["tools"]
     assert args["instructions"] == model_options(settings, load_config())["instructions"]
     assert args["reasoning"] == {"effort": "low"}
     assert args["model"] == settings.model_deployment
-    assert args["store"] is True
-    assert args["conversation"] == "conv_actual_model"
+    assert args["store"] is False
+    assert "conversation" not in args
+    assert args["max_output_tokens"] == 4096
     assert args["input"] == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Question"}]}]
     assert args["stream"] is True
     assert args["include"] == ["reasoning.encrypted_content"]
     assert "agent_reference" not in args and "previous_response_id" not in args
+    following = recorded[1][1]
+    assert following["input"][1:-1] == raw_response["output"]
+    assert following["input"][0]["content"] == args["input"][0]["content"]
+    assert following["input"][-1] == {
+        "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Follow up"}],
+    }
+    assert all("response_id" not in item for item in following["input"])
+    assert following["store"] is False
+    assert "conversation" not in following and "previous_response_id" not in following
+    assert recorded[0][2]["x-agent-foundry-call-id"] == "platform-call-private"
+    assert recorded[1][2]["x-agent-foundry-call-id"] == "platform-call-next"
     for _, _, headers in recorded:
-        assert headers["x-agent-foundry-call-id"] == "platform-call-private"
         assert "x-agent-user-id" not in headers
         assert "x-client-hosted-continuation" not in headers
     evidence = extract_evidence(final)
@@ -265,61 +279,56 @@ async def test_native_call_and_output_pair_are_preserved_as_two_records_not_two_
             assert (await client.get(f"/responses/{result['id']}")).status_code == 404
 
 
-async def test_model_conversation_seeds_once_and_never_reads_outer_history(settings, raw_response):
+async def test_platform_history_and_current_items_forwarded_once_to_direct_model(settings, raw_response):
     seed = [{"role": "user", "content": "Earlier"}, *raw_response["output"]]
     ctx = context(
-        history=[{"role": "user", "content": "Do not replay outer history"}],
-        current=[*seed, {"role": "user", "content": "Next"}],
+        history=seed,
+        current=[{"role": "user", "content": "Next"}],
     )
     client = fake_stream_client(raw_response)
-    conversations = HistoryStore()
     token = set_request_context(FoundryAgentRequestContext(
         call_id="opaque-platform-identity", user_id="container-only-user",
     ))
     try:
-        first = (await collect(client, settings, ctx, conversations=conversations))[-1]["response"]
+        first = (await collect(client, settings, ctx))[-1]["response"]
     finally:
         reset_request_context(token)
     args = client.responses.create.call_args.kwargs
-    created = client.conversations.create.call_args.kwargs
-    assert created["items"] == seed
-    assert args["input"] == [{"role": "user", "content": "Next"}]
-    assert args["conversation"] == first["metadata"]["hosted_model_conversation_id"]
-    assert args["store"] is True
+    assert args["input"] == [*seed, {"role": "user", "content": "Next"}]
+    assert args["input"][1]["encrypted_content"] == "private-ciphertext"
+    assert "conversation" not in args
+    assert args["store"] is False
+    assert args["reasoning"] == {"effort": "low"}
+    assert args["max_output_tokens"] == 4096
     assert args["extra_headers"]["x-agent-foundry-call-id"] == "opaque-platform-identity"
-    assert created["extra_headers"]["x-agent-foundry-call-id"] == "opaque-platform-identity"
     assert "x-agent-user-id" not in args["extra_headers"]
-    assert "x-agent-user-id" not in created["extra_headers"]
     assert "previous_response_id" not in args
-    ctx.get_history.assert_not_awaited()
+    ctx.get_history.assert_awaited_once()
     ctx.get_input_items.assert_awaited_once()
-    continuation = first["metadata"]["hosted_model_continuation"]
-    assert re.fullmatch(r"[A-Za-z0-9_-]{43}", continuation)
-    snapshot = conversations.get(continuation, "hosted_model:container-only-user")
-    assert snapshot.items == []
-    assert snapshot.conversation_id == args["conversation"]
+    assert "hosted_model_continuation" not in first["metadata"]
+    client.conversations.create.assert_not_awaited()
 
-    followup = context(current=[{"role": "user", "content": "Only new input"}])
-    followup.client_headers["x-client-hosted-continuation"] = continuation
+    history = [*args["input"], *first["output"]]
+    followup = context(history=history, current=[{"role": "user", "content": "Only new input"}])
     token = set_request_context(FoundryAgentRequestContext(
         call_id="fresh-platform-identity", user_id="container-only-user",
     ))
     try:
-        second = (await collect(client, settings, followup, conversations=conversations))[-1]["response"]
+        second = (await collect(client, settings, followup))[-1]["response"]
     finally:
         reset_request_context(token)
     assert second["status"] == "completed"
-    assert second["metadata"]["hosted_model_conversation_id"] == args["conversation"]
-    assert second["metadata"]["hosted_model_continuation"] != continuation
-    client.conversations.create.assert_awaited_once()
-    followup.get_history.assert_not_awaited()
+    assert not second.get("conversation")
+    client.conversations.create.assert_not_awaited()
+    followup.get_history.assert_awaited_once()
+    followup.get_input_items.assert_awaited_once()
     latest = client.responses.create.call_args.kwargs
-    assert latest["input"] == [{"role": "user", "content": "Only new input"}]
-    assert latest["conversation"] == args["conversation"]
+    assert latest["input"] == [*history, {"role": "user", "content": "Only new input"}]
+    assert "conversation" not in latest and "previous_response_id" not in latest
     assert latest["extra_headers"]["x-agent-foundry-call-id"] == "fresh-platform-identity"
     assert "x-client-hosted-continuation" not in latest["extra_headers"]
     assert "x-agent-user-id" not in latest["extra_headers"]
-    assert "private-ciphertext" not in json.dumps(latest)
+    assert seed == [{"role": "user", "content": "Earlier"}, *raw_response["output"]]
 
 
 async def test_protocol_two_identity_headers_are_request_scoped(settings, raw_response):
@@ -354,13 +363,8 @@ async def test_protocol_two_identity_headers_are_request_scoped(settings, raw_re
     assert all("x-agent-user-id" not in req["extra_headers"] for req in requests)
     assert "x-agent-foundry-call-id" not in requests[2]["extra_headers"]
     assert requests[0]["extra_headers"] is not requests[1]["extra_headers"]
-    creates = [call.kwargs for call in downstream.conversations.create.await_args_list]
-    assert len(creates) == 3
-    assert {req["extra_headers"]["x-agent-foundry-call-id"] for req in creates[:2]} == {
-        "opaque-call-1", "opaque-call-2",
-    }
-    assert "x-agent-foundry-call-id" not in creates[2]["extra_headers"]
-    assert all("x-agent-user-id" not in req["extra_headers"] for req in creates)
+    downstream.conversations.create.assert_not_awaited()
+    assert all(req["store"] is False for req in requests)
     for response in responses:
         assert "opaque-call-" not in response.text and "container-only-user-" not in response.text
 
@@ -396,11 +400,10 @@ async def test_cancellation_racing_stream_acquisition_closes_stream(settings, ra
 
 
 @pytest.mark.parametrize("signal", ["cancel", "shutdown"])
-async def test_cancellation_during_model_conversation_creation_never_starts_response(settings, raw_response, signal):
+async def test_cancellation_during_platform_history_fetch_never_starts_model(settings, raw_response, signal):
     entered, stopped, cancel = asyncio.Event(), asyncio.Event(), asyncio.Event()
     ctx = context(current=[{"role": "user", "content": "Question"}])
     model = fake_stream_client(raw_response)
-    conversations = HistoryStore()
 
     async def create(**kwargs):
         entered.set()
@@ -409,17 +412,18 @@ async def test_cancellation_during_model_conversation_creation_never_starts_resp
         finally:
             stopped.set()
 
-    model.conversations.create.side_effect = create
-    task = asyncio.create_task(collect(model, settings, ctx, cancel, conversations))
+    ctx.get_history.side_effect = create
+    task = asyncio.create_task(collect(model, settings, ctx, cancel))
     await asyncio.wait_for(entered.wait(), 1)
     (cancel if signal == "cancel" else ctx.shutdown).set()
     events = await asyncio.wait_for(task, 1)
     assert stopped.is_set()
     assert events[-1]["response"]["status"] == "cancelled"
     assert "hosted_model_continuation" not in events[-1]["response"].get("metadata", {})
-    assert not conversations._entries
+    model.conversations.create.assert_not_awaited()
     model.responses.create.assert_not_awaited()
-    ctx.get_history.assert_not_awaited()
+    ctx.get_history.assert_awaited_once()
+    ctx.get_input_items.assert_not_awaited()
 
 
 async def test_partial_text_and_citation_survive_truncation_without_outer_storage(settings, raw_response):

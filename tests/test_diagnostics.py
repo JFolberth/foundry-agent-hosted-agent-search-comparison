@@ -151,12 +151,10 @@ async def test_prompt_conversation_exception_keeps_original_safe_type(raw_respon
     clients["prompt"].responses.create.assert_not_awaited()
 
 
-@pytest.mark.parametrize("stage", ["conversation", "model"])
-async def test_hosted_upstream_errors_reach_web_without_bodies(settings, raw_response, recorded_spans, stage):
+async def test_hosted_upstream_errors_reach_web_without_bodies(settings, raw_response, recorded_spans):
     _, exporter = recorded_spans
     model = fake_stream_client(raw_response)
-    target = model.conversations if stage == "conversation" else model.responses
-    target.create.side_effect = sdk_error(PermissionDeniedError, 403)
+    model.responses.create.side_effect = sdk_error(PermissionDeniedError, 403)
     host = hosted_app(model, settings, store=InMemoryResponseProvider())
     clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
     async with host.router.lifespan_context(host):
@@ -168,15 +166,29 @@ async def test_hosted_upstream_errors_reach_web_without_bodies(settings, raw_res
             clients["hosted"].responses.create.side_effect = invoke
             result = await ComparisonService(clients, load_config()).compare(CompareRequest(message="Q"), COMPARISON_ID)
     diagnostic = result["hosted"]["error_diagnostics"]
-    expected = "hosted.model.conversations.create" if stage == "conversation" else "hosted.model.responses.create"
+    expected = "hosted.model.responses.create"
     assert diagnostic == {"stage": expected, "type": "PermissionDeniedError", "http_status": 403, "request_id": REQUEST_ID}
     assert result["prompt"]["error"] is None
     assert PRIVATE not in json.dumps(result)
+    model.conversations.create.assert_not_awaited()
     for span in exporter.get_finished_spans():
         if span.name in ("hosted.model", "agent.hosted"):
             assert span.status.status_code == StatusCode.ERROR
             assert span.attributes["http.response.status_code"] == 403
             assert _convert_span_to_envelope(span).data.base_data.success is False
+
+
+async def test_hosted_no_longer_requires_model_conversation_create(settings, raw_response):
+    model = fake_stream_client(raw_response)
+    model.conversations.create.side_effect = sdk_error(PermissionDeniedError, 403)
+    host = hosted_app(model, settings, store=InMemoryResponseProvider())
+    async with host.router.lifespan_context(host):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=host), base_url="http://host") as caller:
+            result = (await caller.post("/responses", json={"input": "Q", "store": True})).json()
+    assert result["status"] == "completed"
+    assert result["id"]
+    assert model.responses.create.call_args.kwargs["store"] is False
+    model.conversations.create.assert_not_awaited()
 
 
 @pytest.mark.parametrize("status", ["failed", "incomplete"])

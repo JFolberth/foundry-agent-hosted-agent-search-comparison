@@ -34,7 +34,7 @@ def test_native_prompt_and_hosted_parity(settings):
             "index_name": "documents", "query_type": "simple", "top_k": 5,
         }]},
     }]
-    assert options["store"] is True
+    assert options["store"] is False
     assert options["include"] == ["reasoning.encrypted_content"]
 
 

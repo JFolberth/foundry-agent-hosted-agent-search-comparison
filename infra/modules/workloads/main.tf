@@ -88,6 +88,12 @@ resource "azapi_resource" "web" {
   location  = var.location
   tags      = var.tags
 
+  # Azure reorders probes. Match by type so missing fields cannot migrate from
+  # Startup to Liveness during refresh; nested list paths omit array indexes.
+  list_unique_id_property = {
+    "properties.template.containers.probes" = "type"
+  }
+
   identity {
     type         = "UserAssigned"
     identity_ids = [var.ui_identity_id]
@@ -100,9 +106,10 @@ resource "azapi_resource" "web" {
       configuration = {
         activeRevisionsMode = "Single"
         ingress = {
-          external      = true
-          targetPort    = 8080
-          transport     = "auto"
+          external   = true
+          targetPort = 8080
+          # Match Azure's returned spelling without ignoring case across env/secrets.
+          transport     = "Auto"
           allowInsecure = false
           traffic       = [{ latestRevision = true, weight = 100 }]
         }

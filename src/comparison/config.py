@@ -105,6 +105,6 @@ def model_options(settings: Settings, config: AgentConfig) -> dict:
         "tools": [native_search_tool(settings, config).as_dict()],
         "reasoning": {"effort": config.reasoning_effort},
         "max_output_tokens": config.max_output_tokens,
-        "store": True,
+        "store": False,
         "include": ["reasoning.encrypted_content"],
     }
