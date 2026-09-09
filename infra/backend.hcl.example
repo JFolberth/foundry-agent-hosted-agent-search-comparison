@@ -1,0 +1,7 @@
+# Remote backend configuration only; see backend.tf before using this file.
+# Authenticate using the CLI locally or ARM_USE_OIDC/ARM_CLIENT_ID in automation.
+# Supply ARM_TENANT_ID privately; never put credentials in backend configuration.
+container_name       = "tfstate"
+key                  = "foundry-search-comparison/dev.tfstate"
+storage_account_name = "replacemestateaccount"
+use_azuread_auth      = true

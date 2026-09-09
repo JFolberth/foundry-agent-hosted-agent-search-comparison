@@ -1,0 +1,375 @@
+(() => {
+  'use strict';
+
+  const MAX_MESSAGE_LENGTH = 4000;
+  const MAX_HISTORY_MESSAGES = 20;
+  const MAX_HISTORY_MESSAGE_LENGTH = 12000;
+  const MAX_HISTORY_LENGTH = 24000;
+  const agents = ['prompt', 'hosted'];
+  const form = document.getElementById('compare-form');
+  const messageInput = document.getElementById('message');
+  const submitButton = document.getElementById('submit');
+  const resetButton = document.getElementById('reset');
+  const status = document.getElementById('status');
+  const formError = document.getElementById('form-error');
+  let history = { prompt: [], hosted: [] };
+  let continuation = { prompt: null, hosted: null };
+  let pending = false;
+
+  function element(tag, text, className) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  }
+
+  function safeText(value) {
+    if (typeof value === 'string') return value;
+    if (value === null || value === undefined) return '';
+    return JSON.stringify(value, null, 2);
+  }
+
+  function updateCount() {
+    document.getElementById('character-count').textContent =
+      `${messageInput.value.length.toLocaleString()} / 4,000`;
+  }
+
+  function setPending(value) {
+    pending = value;
+    submitButton.disabled = value;
+    resetButton.disabled = value;
+    messageInput.readOnly = value;
+    submitButton.textContent = value ? 'Comparing…' : 'Compare answers ↗';
+    for (const agent of agents) {
+      document.getElementById(`${agent}-panel`).setAttribute('aria-busy', String(value));
+    }
+  }
+
+  function setPanelState(agent, label, state = '') {
+    const badge = document.getElementById(`${agent}-state`);
+    badge.textContent = label;
+    badge.className = `state ${state}`.trim();
+  }
+
+  function renderCorrelation(agent, result = {}) {
+    const section = element('section', undefined, 'diagnostics');
+    const heading = element('h4', 'Conversation & telemetry');
+    heading.id = `${agent}-correlation-heading`;
+    section.setAttribute('aria-labelledby', heading.id);
+    const values = element('dl');
+    const feedback = element('p', '', 'copy-status');
+    feedback.setAttribute('role', 'status');
+    feedback.setAttribute('aria-live', 'polite');
+    feedback.setAttribute('aria-atomic', 'true');
+    const identifiers = [
+      [result.conversation_scope === 'hosted_model' ? 'Hosted model conversation' : 'Foundry conversation', result.conversation_id],
+      ['Foundry agent response', result.response_id],
+      ['UI invocation · App Insights operation / trace ID', result.trace_id],
+      ['UI invocation span ID', result.span_id]
+    ];
+    if (agent === 'hosted') {
+      identifiers.splice(2, 0, ['Hosted model response', result.model_response_id]);
+      identifiers.push(
+        ['Hosted runtime · App Insights operation / trace ID', result.hosted_runtime_trace_id],
+        ['Hosted runtime span ID', result.hosted_runtime_span_id]
+      );
+    }
+    for (const [label, value] of identifiers) {
+      const reported = typeof value === 'string' && value.trim().length > 0;
+      const item = element('div');
+      const description = element('dd');
+      description.append(element('span', reported ? value : 'Not reported', 'correlation-value'));
+      if (reported) {
+        const copy = element('button', 'Copy', 'button secondary copy-id');
+        copy.type = 'button';
+        copy.setAttribute('aria-label', `Copy ${label} for ${agent === 'prompt' ? 'Prompt agent' : 'Hosted agent'}`);
+        copy.addEventListener('click', async () => {
+          copy.disabled = true;
+          feedback.textContent = `Copying ${label}…`;
+          try {
+            if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) {
+              throw new Error('Clipboard unavailable');
+            }
+            await navigator.clipboard.writeText(value);
+            feedback.textContent = `${label} copied.`;
+          } catch {
+            feedback.textContent = `Could not copy ${label}. Select and copy the value manually.`;
+          } finally {
+            copy.disabled = false;
+          }
+        });
+        description.append(copy);
+      }
+      item.append(element('dt', label), description);
+      values.append(item);
+    }
+    section.append(heading, values);
+    const conversationNote = safeText(result.conversation_note);
+    if (conversationNote.trim()) {
+      section.append(element('p', conversationNote, 'evidence-note'));
+    }
+    const telemetryNote = safeText(result.telemetry_note);
+    if (telemetryNote.trim()) {
+      section.append(element('p', telemetryNote, 'evidence-note'));
+    }
+    const hostedTelemetryNote = safeText(result.hosted_runtime_telemetry_note);
+    if (agent === 'hosted' && hostedTelemetryNote.trim()) {
+      section.append(element('p', `Hosted runtime telemetry: ${hostedTelemetryNote}`, 'evidence-note'));
+    }
+    section.append(feedback);
+    return section;
+  }
+
+  function showPanelError(agent, error, result = {}) {
+    const content = document.getElementById(`${agent}-content`);
+    const notice = element('div', undefined, 'error-notice');
+    notice.append(
+      element('h4', 'This agent could not complete the request'),
+      element('p', safeText(error)),
+      element('p', 'This turn was not added to this agent’s history. Follow the error guidance above, or select New comparison to clear both histories.')
+    );
+    content.replaceChildren(notice, renderCorrelation(agent, result));
+    setPanelState(agent, 'Error', 'error');
+    return content;
+  }
+
+  function metric(label, value) {
+    const item = element('div', undefined, 'metric');
+    item.append(element('dt', label), element('dd', value));
+    return item;
+  }
+
+  function tokenCount(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+      ? value.toLocaleString()
+      : 'Not reported';
+  }
+
+  function renderMetrics(result) {
+    const metrics = element('dl', undefined, 'metrics');
+    const latency = result.latency_ms;
+    const latencyText = typeof latency === 'number' && Number.isFinite(latency) && latency >= 0
+      ? `${(latency / 1000).toLocaleString(undefined, { maximumFractionDigits: 2 })} s`
+      : 'Not reported';
+    metrics.append(
+      metric('Latency', latencyText),
+      metric('Input tokens', tokenCount(result.usage?.input_tokens)),
+      metric('Output tokens', tokenCount(result.usage?.output_tokens)),
+      metric('Reasoning tokens', tokenCount(result.usage?.output_tokens_details?.reasoning_tokens))
+    );
+    return metrics;
+  }
+
+  function renderTools(result) {
+    const section = element('section', undefined, 'evidence-section');
+    section.append(element('h4', 'Native tool evidence'));
+    const calls = Array.isArray(result.tool_calls) ? result.tool_calls : [];
+    const available = result.tool_evidence_available === true && Array.isArray(result.tool_calls);
+    const truncated = result.tool_evidence_truncated === true;
+    section.append(element('p',
+      available
+        ? `${truncated ? 'At least ' : ''}${calls.length} observed tool record${calls.length === 1 ? '' : 's'}`
+        : 'Not exposed by response',
+      'evidence-status'
+    ));
+    if (truncated) {
+      section.append(element('p', 'Tool evidence was truncated; additional records or details may be omitted.', 'evidence-note'));
+    }
+    const note = safeText(result.tool_evidence_note);
+    if (note.trim()) section.append(element('p', note, 'evidence-note'));
+    for (const [index, call] of calls.entries()) {
+      const details = element('details');
+      const name = call && typeof call === 'object'
+        ? call.name || call.function?.name || call.tool_name || call.type
+        : null;
+      details.append(
+        element('summary', `Tool record ${index + 1}${name ? ` · ${safeText(name)}` : ''}`),
+        element('pre', safeText(call), 'tool-json')
+      );
+      section.append(details);
+    }
+    return section;
+  }
+
+  function allowedUrl(value) {
+    if (typeof value !== 'string') return null;
+    try {
+      const url = new URL(value);
+      return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password
+        ? url.href : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function renderCitations(citations) {
+    const section = element('section', undefined, 'citations-section');
+    section.append(element('h4', 'Citations'));
+    if (!Array.isArray(citations) || citations.length === 0) {
+      section.append(element('p', 'No citations returned.', 'muted'));
+      return section;
+    }
+    const list = element('ol');
+    for (const citation of citations) {
+      const object = citation && typeof citation === 'object' ? citation : {};
+      const rawUrl = typeof citation === 'string' ? citation : object.url || object.uri || object.href;
+      const url = allowedUrl(rawUrl);
+      const label = safeText(object.title || object.label || object.name || rawUrl || citation);
+      const item = element('li');
+      if (url) {
+        const link = element('a', label || url);
+        link.href = url;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.referrerPolicy = 'no-referrer';
+        link.append(element('span', ' (opens in a new tab)', 'sr-only'));
+        item.append(link);
+      } else {
+        item.textContent = label || 'Citation details not provided';
+      }
+      list.append(item);
+    }
+    section.append(list);
+    return section;
+  }
+
+  function renderResult(agent, result, question) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+      showPanelError(agent, 'The server did not return a valid result for this agent.');
+      return false;
+    }
+    const hasError = result.error !== null && result.error !== undefined && result.error !== '';
+    const hasText = typeof result.text === 'string' && result.text.trim().length > 0;
+    let content;
+    if (hasError || !hasText) {
+      content = showPanelError(agent, hasError ? result.error : 'No answer text was returned.', result);
+    } else {
+      content = document.getElementById(`${agent}-content`);
+      content.replaceChildren(renderCorrelation(agent, result));
+      setPanelState(agent, 'Complete', 'success');
+    }
+    if (hasText) {
+      const answer = element('section', undefined, 'answer-section');
+      answer.append(
+        element('h4', hasError || result.output_truncated === true ? 'Partial answer' : 'Answer'),
+        element('div', result.text, 'answer-text')
+      );
+      content.append(answer);
+    }
+    if (result.output_truncated === true) {
+      content.append(element('p',
+        'The returned answer was truncated. Some answer text may be omitted.',
+        'evidence-note'
+      ));
+    }
+    content.append(renderMetrics(result), renderTools(result), renderCitations(result.citations));
+    if (!hasError && hasText) {
+      history[agent] = [
+        ...history[agent],
+        { role: 'user', content: question },
+        { role: 'assistant', content: result.text.slice(0, MAX_HISTORY_MESSAGE_LENGTH) }
+      ].slice(-MAX_HISTORY_MESSAGES);
+      while (history[agent].reduce((length, message) => length + message.content.length, 0) > MAX_HISTORY_LENGTH) {
+        history[agent].splice(0, 2);
+      }
+      if (result.text.length > MAX_HISTORY_MESSAGE_LENGTH) {
+        content.append(element('p',
+          'The returned text is displayed in full. Only its first 12,000 characters are kept in text history.',
+          'evidence-note'
+        ));
+      }
+      continuation[agent] = typeof result.continuation === 'string' ? result.continuation : null;
+      return true;
+    }
+    return false;
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (pending) return;
+    const question = messageInput.value.trim();
+    formError.hidden = true;
+    if (!question || messageInput.value.length > MAX_MESSAGE_LENGTH) {
+      formError.textContent = 'Enter a question between 1 and 4,000 characters.';
+      formError.hidden = false;
+      messageInput.focus();
+      return;
+    }
+
+    setPending(true);
+    document.getElementById('comparison-id').textContent = 'Comparison ID: pending';
+    document.getElementById('last-question').hidden = false;
+    document.getElementById('last-question-text').textContent = question;
+    status.textContent = 'Comparing both agents. Answers and tool evidence will appear when the server responds.';
+    for (const agent of agents) {
+      setPanelState(agent, 'Working', 'working');
+      document.getElementById(`${agent}-content`).replaceChildren(
+        element('p', 'Waiting for the agent’s answer and available search evidence…', 'empty-state')
+      );
+    }
+
+    try {
+      const response = await fetch('/api/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ message: question, history, continuation })
+      });
+      if (!response.ok) {
+        throw new Error(`The comparison request failed (HTTP ${response.status}). Please try again.`);
+      }
+      const data = await response.json();
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('The server returned an invalid comparison response. Please try again.');
+      }
+      document.getElementById('comparison-id').textContent =
+        `Comparison ID: ${safeText(data.comparison_id) || 'Not reported'}`;
+      const outcomes = agents.map((agent) => renderResult(agent, data[agent], question));
+      const completed = outcomes.filter(Boolean).length;
+      status.textContent = completed === 2
+        ? 'Both answers are ready. Compare the responses and expand the tool evidence below.'
+        : completed === 1
+          ? 'One answer is ready; the other agent reported an error. Only the successful history was updated.'
+          : 'Neither agent completed the request. Both conversation histories are unchanged.';
+      if (completed === 2) {
+        messageInput.value = '';
+        updateCount();
+      }
+    } catch (error) {
+      const text = error instanceof TypeError
+        ? 'Could not reach the comparison service. Check your connection and try again.'
+        : error instanceof SyntaxError
+          ? 'The server returned unreadable data. Please try again.'
+          : error.message || 'The comparison failed. Please try again.';
+      for (const agent of agents) showPanelError(agent, text);
+      document.getElementById('comparison-id').textContent = 'Comparison ID: unavailable';
+      status.textContent = 'The comparison failed. Both conversation histories are unchanged.';
+    } finally {
+      setPending(false);
+    }
+  });
+
+  messageInput.addEventListener('input', () => {
+    updateCount();
+    formError.hidden = true;
+  });
+
+  resetButton.addEventListener('click', () => {
+    if (pending) return;
+    history = { prompt: [], hosted: [] };
+    continuation = { prompt: null, hosted: null };
+    messageInput.value = '';
+    updateCount();
+    formError.hidden = true;
+    document.getElementById('comparison-id').textContent = 'Comparison ID: —';
+    document.getElementById('last-question').hidden = true;
+    document.getElementById('last-question-text').textContent = '';
+    status.textContent = 'Browser histories and continuation tokens cleared. Foundry-stored conversations and responses are not deleted. Start a new comparison.';
+    for (const agent of agents) {
+      setPanelState(agent, 'Ready');
+      document.getElementById(`${agent}-content`).replaceChildren(
+        element('p', 'An answer will appear here, alongside timing, token usage, citations, and available tool evidence.', 'empty-state')
+      );
+    }
+    messageInput.focus();
+  });
+})();

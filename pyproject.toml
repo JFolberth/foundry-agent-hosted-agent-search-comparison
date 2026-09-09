@@ -1,0 +1,105 @@
+[project]
+name = "foundry-agent-search-comparison"
+version = "0.1.0"
+description = "Native Azure AI Search comparison between two Foundry agents"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "aiohttp==3.14.3",
+  "azure-ai-projects==2.6.0",
+  "azure-ai-agentserver-responses==2.1.0",
+  "azure-identity==1.25.3",
+  "azure-monitor-opentelemetry==1.8.9",
+  "fastapi==0.141.1",
+  "openai==3.7.0",
+  "uvicorn==0.52.4",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+]
+
+[tool.uv]
+package = false
+environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[[tool.uv.index]]
+name = "azure-sdk-public"
+url = "https://pkgs.dev.azure.com/azure-sdk/public/_packaging/azure-sdk-for-python/pypi/simple/"
+default = true
+
+# The public feed's universal2 wheel returns 401 during metadata discovery.
+# Exact upstream metadata: https://pypi.org/pypi/aiohttp/3.14.3/json
+# Keep normal index resolution and platform-specific wheel selection for sync.
+[[tool.uv.dependency-metadata]]
+name = "aiohttp"
+version = "3.14.3"
+requires-python = ">=3.10"
+provides-extra = ["speedups"]
+requires-dist = [
+  "aiohappyeyeballs>=2.5.0",
+  "aiosignal>=1.4.0",
+  "async-timeout<6.0,>=4.0; python_version < '3.11'",
+  "attrs>=17.3.0",
+  "frozenlist>=1.1.1",
+  "multidict<7.0,>=4.5",
+  "propcache>=0.2.0",
+  "typing_extensions>=4.4; python_version < '3.13'",
+  "yarl<2.0,>=1.17.0",
+  "aiodns>=3.3.0; (sys_platform != 'android' and sys_platform != 'ios') and extra == 'speedups'",
+  "Brotli>=1.2; (platform_python_implementation == 'CPython' and sys_platform != 'android' and sys_platform != 'ios') and extra == 'speedups'",
+  "brotlicffi>=1.2; platform_python_implementation != 'CPython' and extra == 'speedups'",
+  "backports.zstd; (platform_python_implementation == 'CPython' and python_version < '3.14' and sys_platform != 'android' and sys_platform != 'ios') and extra == 'speedups'",
+]
+
+# Same metadata-discovery workaround; this release has no dependencies.
+# Exact upstream metadata: https://pypi.org/pypi/propcache/0.5.2/json
+[[tool.uv.dependency-metadata]]
+name = "propcache"
+version = "0.5.2"
+requires-python = ">=3.10"
+requires-dist = []
+
+# Exact upstream metadata: https://pypi.org/pypi/yarl/1.24.5/json
+[[tool.uv.dependency-metadata]]
+name = "yarl"
+version = "1.24.5"
+requires-python = ">=3.10"
+requires-dist = ["idna>=2.0", "multidict>=4.0", "propcache>=0.2.1"]
+
+# Exact upstream metadata: https://pypi.org/pypi/multidict/6.7.1/json
+[[tool.uv.dependency-metadata]]
+name = "multidict"
+version = "6.7.1"
+requires-python = ">=3.9"
+requires-dist = ["typing-extensions>=4.1.0; python_version < '3.11'"]
+
+# The feed also rejects this release's x86_64 macOS metadata-discovery wheel.
+# Exact upstream metadata: https://pypi.org/pypi/wrapt/2.4.0/json
+[[tool.uv.dependency-metadata]]
+name = "wrapt"
+version = "2.4.0"
+requires-python = ">=3.9"
+provides-extra = ["dev"]
+requires-dist = ["pytest; extra == 'dev'", "setuptools; extra == 'dev'"]
+
+# Exact upstream metadata: https://pypi.org/pypi/pydantic-core/2.46.5/json
+[[tool.uv.dependency-metadata]]
+name = "pydantic-core"
+version = "2.46.5"
+requires-python = ">=3.9"
+requires-dist = ["typing-extensions>=4.14.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"

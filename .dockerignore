@@ -1,0 +1,17 @@
+**
+!pyproject.toml
+!uv.lock
+!config/
+!config/agent.json
+!containers/
+!containers/*.Dockerfile
+!src/
+!src/comparison/
+!src/comparison/**
+!src/hosted_agent/
+!src/hosted_agent/**
+!src/web/
+!src/web/**
+**/__pycache__/
+**/*.pyc
+**/.env*

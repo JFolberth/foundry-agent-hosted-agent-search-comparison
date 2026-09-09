@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="description" content="Compare Prompt and Hosted agent answers and Azure AI Search tool evidence with one shared conversation.">
+    <title>Agent comparison · Azure AI Search</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <main class="workspace">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">Azure AI Search · Agent comparison</p>
+          <h1>One question. Two perspectives.</h1>
+          <p class="subtitle">Compare answers and inspect native search tool evidence, side by side.</p>
+        </div>
+        <button id="reset" class="button secondary" type="button">New comparison</button>
+      </header>
+
+      <aside class="demo-notice" aria-label="Public demo privacy notice">
+        <strong>Public, anonymous demo.</strong> Only use non-sensitive demo content.
+        Your question is sent to both agents through the server.
+        Foundry stores conversations and responses for both agents.
+        Starting a new comparison or expiry of the demo’s 20-minute continuation token
+        does not delete those stored conversations or responses.
+      </aside>
+
+      <section class="composer-card" aria-labelledby="composer-heading">
+        <form id="compare-form">
+          <div class="composer-heading">
+            <h2 id="composer-heading">Ask both agents</h2>
+            <span class="badge">Shared prompt · Separate histories</span>
+          </div>
+          <label for="message">Your question</label>
+          <textarea id="message" name="message" rows="4" maxlength="4000" required
+            placeholder="Ask a question about the demo search content…"
+            aria-describedby="message-help character-count"></textarea>
+          <div class="input-meta">
+            <span id="message-help">Follow-ups use each agent’s own successful conversation history.</span>
+            <span id="character-count">0 / 4,000</span>
+          </div>
+          <div class="composer-actions">
+            <div class="reasoning-control">
+              <label for="reasoning">Reasoning effort</label>
+              <select id="reasoning" disabled aria-describedby="reasoning-help">
+                <option value="low" selected>Low</option>
+              </select>
+              <span id="reasoning-help">Fixed to low for this demo</span>
+            </div>
+            <button id="submit" class="button primary" type="submit">Compare answers <span aria-hidden="true">↗</span></button>
+          </div>
+          <p id="form-error" class="form-error" role="alert" hidden></p>
+        </form>
+      </section>
+
+      <section class="comparison" aria-labelledby="comparison-heading">
+        <div class="comparison-heading">
+          <h2 id="comparison-heading">The comparison</h2>
+          <p id="comparison-id" class="comparison-id">Comparison ID: —</p>
+        </div>
+        <p id="status" class="status" role="status" aria-live="polite" aria-atomic="true">Ready when you are. Both agents receive the same question.</p>
+        <div id="last-question" class="last-question" hidden>
+          <h3>Latest question</h3>
+          <p id="last-question-text"></p>
+        </div>
+        <div class="results">
+          <article id="prompt-panel" class="agent-panel" aria-labelledby="prompt-heading" aria-busy="false">
+            <header class="panel-header">
+              <div><p class="eyebrow">01 / Prompt</p><h3 id="prompt-heading">Prompt agent</h3></div>
+              <span id="prompt-state" class="state">Ready</span>
+            </header>
+            <div id="prompt-content" class="panel-content">
+              <p class="empty-state">An answer will appear here, alongside timing, token usage, citations, and available tool evidence.</p>
+            </div>
+          </article>
+          <article id="hosted-panel" class="agent-panel" aria-labelledby="hosted-heading" aria-busy="false">
+            <header class="panel-header">
+              <div><p class="eyebrow">02 / Hosted</p><h3 id="hosted-heading">Hosted agent</h3></div>
+              <span id="hosted-state" class="state">Ready</span>
+            </header>
+            <div id="hosted-content" class="panel-content">
+              <p class="empty-state">An answer will appear here, alongside timing, token usage, citations, and available tool evidence.</p>
+            </div>
+          </article>
+        </div>
+      </section>
+      <footer>
+        Tool details show evidence returned by the backend, not inferred activity.
+        Missing evidence does not mean no search occurred.
+        New comparison clears browser histories and continuation tokens, not Foundry-stored conversations or responses.
+      </footer>
+      <noscript><p class="demo-notice">Enable JavaScript to compare agents.</p></noscript>
+    </main>
+  </body>
+</html>

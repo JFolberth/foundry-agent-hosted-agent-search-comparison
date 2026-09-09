@@ -1,0 +1,34 @@
+{
+  "name": "foundry-agent-hosted-agent-search-comparison",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "runArgs": ["--platform=linux/amd64"],
+  "features": {
+    "ghcr.io/devcontainers/features/azure-cli:1": {
+      "version": "latest",
+      "extensions": "cognitiveservices"
+    },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false
+    },
+    "ghcr.io/devcontainers/features/terraform:1": {
+      "version": "latest",
+      "tflint": "latest"
+    }
+  },
+  "postCreateCommand": "python -m pip install uv && uv sync --frozen",
+  "forwardPorts": [8080, 8088],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-azuretools.vscode-docker",
+        "ms-vscode.azurecli",
+        "ms-python.python",
+        "hashicorp.terraform"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+        "python.terminal.useEnvFile": true
+      }
+    }
+  }
+}
