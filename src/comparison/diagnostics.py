@@ -3,6 +3,7 @@ import logging
 import re
 from collections.abc import Mapping
 
+from openai import APIError
 from opentelemetry.trace import Status, StatusCode
 
 STAGES = frozenset({
@@ -16,7 +17,7 @@ STAGES = frozenset({
 ERROR_TYPES = frozenset({
     "BadRequestError", "AuthenticationError", "PermissionDeniedError", "NotFoundError",
     "ConflictError", "UnprocessableEntityError", "RateLimitError", "InternalServerError",
-    "APIStatusError", "APIConnectionError", "APITimeoutError", "APIResponseValidationError",
+    "APIError", "APIStatusError", "APIConnectionError", "APITimeoutError", "APIResponseValidationError",
     "ClientAuthenticationError", "CredentialUnavailableError", "HttpResponseError",
     "ServiceRequestError", "ServiceResponseError", "TimeoutError", "ValueError",
     "HistoryExpired", "HistoryFull", "CancelledError", "CancelledStream", "InterruptedStream",
@@ -36,6 +37,9 @@ def http_status(value):
 
 def failure(stage, exc=None, *, kind=None, status=None, request=None):
     name = type(exc).__name__ if exc is not None else kind
+    # Streaming failures can arrive after HTTP 200 as APIError, not RateLimitError.
+    if isinstance(exc, APIError) and exc.code == "rate_limit_exceeded":
+        name = "RateLimitError"
     if exc is not None:
         status = getattr(exc, "status_code", None)
         request = getattr(exc, "request_id", None)

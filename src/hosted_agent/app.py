@@ -291,6 +291,7 @@ async def stream_response(client, settings, config, request, context, cancellati
         diagnostic = failure(stage, exc)
         envelope.update(status="failed", error={"code": "server_error", "message": "Hosted model request failed."})
     if diagnostic:
+        diagnostic["request_id"] = diagnostic["request_id"] or upstream_request_id
         envelope.setdefault("metadata", {}).update(to_metadata(diagnostic))
     if terminal is None or envelope["status"] not in ("completed", "incomplete", "failed", "cancelled"):
         envelope["output"] = [done_items.get(i, seen[i]) for i in sorted(seen)]

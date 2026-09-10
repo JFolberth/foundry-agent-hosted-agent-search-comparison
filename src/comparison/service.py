@@ -175,6 +175,8 @@ class ComparisonService:
             result["error_diagnostics"] = None
             if result["error"] is not None:
                 diagnostic = diagnostic or failure(stage, kind="ValueError")
+                if diagnostic["type"] == "RateLimitError":
+                    result["error"] = "Model deployment rate limit reached. Wait before starting a new comparison."
                 result["error_diagnostics"] = diagnostic
                 record_failure(span, diagnostic, comparison_id)
             result.update(telemetry_ids())

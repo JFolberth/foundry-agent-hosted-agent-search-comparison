@@ -10,7 +10,7 @@ import pytest
 from azure.ai.agentserver.responses import InMemoryResponseProvider, ResponseContext
 from azure.core.exceptions import ClientAuthenticationError
 from azure.monitor.opentelemetry.exporter.export.trace._exporter import _convert_span_to_envelope
-from openai import BadRequestError, PermissionDeniedError
+from openai import APIError, BadRequestError, PermissionDeniedError
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -20,7 +20,7 @@ from comparison.config import load_config
 from comparison.contracts import CompareRequest
 from comparison.diagnostics import configure_safe_logging, failure, from_metadata, record_failure
 from comparison.service import ComparisonService
-from conftest import fake_client, fake_stream_client
+from conftest import FakeStream, fake_client, fake_stream_client
 from hosted_agent.app import create_app as hosted_app
 from web.app import create_app
 
@@ -57,6 +57,62 @@ def test_structured_exception_diagnostics_exclude_content():
         "http_status": 400, "request_id": REQUEST_ID,
     }
     assert PRIVATE not in json.dumps(diagnostic)
+
+
+@pytest.mark.parametrize("code,expected", [
+    ("rate_limit_exceeded", "RateLimitError"),
+    (PRIVATE, "APIError"),
+    (None, "APIError"),
+])
+def test_stream_api_error_classification_does_not_invent_http_status(code, expected):
+    error = APIError(PRIVATE, request=httpx2.Request("POST", f"https://example.invalid/{PRIVATE}"),
+                     body={"code": code, "message": PRIVATE})
+    diagnostic = failure("hosted.model.stream", error)
+    assert diagnostic == {
+        "stage": "hosted.model.stream", "type": expected,
+        "http_status": None, "request_id": None,
+    }
+    assert PRIVATE not in json.dumps(diagnostic)
+
+
+async def test_stream_throttling_reaches_ui_without_private_details(settings, raw_response, recorded_spans):
+    class ThrottledStream(FakeStream):
+        async def __aiter__(self):
+            yield {"type": "response.created", "response": {"id": "resp_throttled", "status": "in_progress"}}
+            raise APIError(PRIVATE, request=httpx2.Request("POST", "https://example.invalid/responses"),
+                           body={"code": "rate_limit_exceeded", "message": PRIVATE})
+
+    stream = ThrottledStream([])
+    stream.response = httpx2.Response(200, headers={"x-request-id": REQUEST_ID})
+    model = fake_stream_client(raw_response)
+    model.responses.create = AsyncMock(return_value=stream)
+    host = hosted_app(model, settings, store=InMemoryResponseProvider())
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    async with host.router.lifespan_context(host):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=host), base_url="http://host") as caller:
+            async def invoke(**kwargs):
+                headers = kwargs.pop("extra_headers")
+                response = await caller.post("/responses", json=kwargs, headers=headers)
+                raw = response.json()
+                return SimpleNamespace(model_dump=lambda **kwargs: raw)
+
+            clients["hosted"].responses.create.side_effect = invoke
+            result = await ComparisonService(clients, load_config()).compare(CompareRequest(message="Q"), COMPARISON_ID)
+    assert result["hosted"]["error_diagnostics"] == {
+        "stage": "hosted.model.stream", "type": "RateLimitError",
+        "http_status": None, "request_id": REQUEST_ID,
+    }
+    assert "rate limit reached" in result["hosted"]["error"]
+    assert result["hosted"]["continuation"] is None
+    assert result["prompt"]["error"] is None
+    assert PRIVATE not in json.dumps(result)
+    assert stream.closed
+    model.responses.create.assert_awaited_once()
+    spans = recorded_spans[1].get_finished_spans()
+    for span in spans:
+        if span.name in ("hosted.model", "agent.hosted"):
+            assert span.status.status_code == StatusCode.ERROR
+            assert span.attributes["error.type"] == "RateLimitError"
 
 
 @pytest.mark.parametrize("value", [None, {}, [], "<script>", "Bearer secret", "x" * 500])
