@@ -544,6 +544,27 @@ class PermissionReadinessTests(unittest.TestCase):
             deploy.permission_readiness(session)
         session.tf.assert_not_called()
 
+    def test_partial_names_allowed_during_in_place_agent_count_migration(self):
+        # Applied state predates newly added AGENT_SIDES entries (e.g. rolling out
+        # prompt_none/hosted_none on top of an already-applied prompt/hosted state);
+        # readiness must still pass using whichever names are already known.
+        session, _, values, _ = fixture()
+        values["outputs"]["workload_agent_names"]["value"] = {
+            "prompt": "search-prompt", "hosted": "search-hosted",
+        }
+        with (patch.object(deploy, "confirm_project"),
+              patch.object(deploy, "azure_request", side_effect=[{"value": []}, {}]),
+              patch.object(deploy, "foundry_request",
+                           side_effect=[{"data": []}, http_error(404), http_error(404)]),
+              patch("sys.stdout", new_callable=io.StringIO)):
+            deploy.permission_readiness(session)
+
+    def test_empty_names_still_refused(self):
+        session, _, values, _ = fixture()
+        values["outputs"]["workload_agent_names"]["value"] = {}
+        with self.assertRaisesRegex(deploy.DeploymentError, "at least one valid configured agent name"):
+            deploy.permission_readiness(session)
+
     def test_missing_parent_project_is_not_authorization(self):
         session, _, _, _ = fixture()
         with (patch.object(deploy, "confirm_project", side_effect=http_error(404)),

@@ -1423,10 +1423,15 @@ def permission_readiness(session, timeout=600):
     names = outputs.get("workload_agent_names")
     if names is None:
         names = {side: outputs.get(f"{side}_agent_name") for side in AGENT_SIDES}
-    require(isinstance(names, dict) and set(names) == set(AGENT_SIDES)
+    # Newly configured sides have no applied output yet (this is the additive, in-place
+    # migration case); require at least one already-known name to check readiness against,
+    # but do not demand all four before any of them have ever been applied.
+    names = {side: name for side, name in names.items() if side in AGENT_SIDES and name is not None}
+    require(isinstance(names, dict) and names
             and all(isinstance(name, str) and re.fullmatch(r"[a-zA-Z0-9_-][a-zA-Z0-9_.-]*", name)
                     for name in names.values()) and len(set(names.values())) == len(names),
-            "Foundation must output all four configured agent names (workload_agent_names or direct name outputs).")
+            "Foundation must output at least one valid configured agent name "
+            "(workload_agent_names or direct name outputs).")
     index_name = outputs.get("search_index_name")
     require(isinstance(index_name, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]*", index_name),
             "Foundation must output a valid Search index name.")
