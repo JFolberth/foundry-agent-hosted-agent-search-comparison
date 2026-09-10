@@ -7,6 +7,12 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 
+test('introduces metadata-grounded book recommendations without promising plot summaries', () => {
+  assert.match(html, /One book catalog\. Two agents\./);
+  assert.match(html, /Recommend three books by Agatha Christie/);
+  assert.match(html, /book metadata, not plot summaries/);
+});
+
 class Node {
   constructor(tag = 'div') {
     this.tagName = tag;

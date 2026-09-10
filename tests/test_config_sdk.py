@@ -26,6 +26,10 @@ def test_native_prompt_and_hosted_parity(settings):
     assert data["tools"] == options["tools"] == [native_search_tool(settings, config).as_dict()]
     assert options["reasoning"] == data["reasoning"] == {"effort": "low"}
     assert options["instructions"] == data["instructions"] == config.instructions
+    assert "book recommender" in config.instructions
+    assert "Search before every recommendation" in config.instructions
+    assert "only titles present in the current turn's retrieved records" in config.instructions
+    assert "do not recommend books from memory" in config.instructions
     assert options["model"] == data["model"] == settings.model_deployment
     assert options["tools"] == [{
         "type": "azure_ai_search",

@@ -1,0 +1,37 @@
+{
+  "dataset": "Azure AI Search sample data: good-books",
+  "local_file": "data/books.csv",
+  "requested_url": "https://raw.githubusercontent.com/Azure-Samples/azure-search-sample-data/refs/heads/main/good-books/books.csv",
+  "pinned_url": "https://raw.githubusercontent.com/Azure-Samples/azure-search-sample-data/dd3c4cb6bd6514d1a2a833dfd7d8062bed722999/good-books/books.csv",
+  "upstream_csv_commit": "dd3c4cb6bd6514d1a2a833dfd7d8062bed722999",
+  "sha256": "a45ed8ece98f12b08a632d4bcf1ed425d76c137614d78136750b9f927317fa53",
+  "pinned_download_sha256_verified": true,
+  "rows": 10000,
+  "attribution": {
+    "publisher": "Azure-Samples",
+    "repository": "https://github.com/Azure-Samples/azure-search-sample-data",
+    "readme": "https://github.com/Azure-Samples/azure-search-sample-data/blob/main/README.md#good-books",
+    "readme_description": "Contains a CSV file containing 10,000 book titles.",
+    "readme_usage": "Tutorial: Add search to static web apps",
+    "license": null,
+    "license_note": "No license established for this CSV. The repository root LICENSE endpoint returned HTTP 404; the README good-books section supplies no license. No license or upstream attribution beyond the source repository is inferred."
+  },
+  "preservation": {
+    "csv": "Exact downloaded bytes, unmodified.",
+    "metadata": "All original nonempty values are retained verbatim as labeled text, including IDs, ratings, publication year, language, ISBN values, and image URLs.",
+    "isbn13": "Scientific-notation values in the source are already lossy. They are preserved as strings, never repaired or expanded.",
+    "limitations": "Metadata only. No genres, plot summaries, full text, or independently verified bibliographic details are supplied."
+  },
+  "search_mapping": {
+    "id": "book-{book_id}",
+    "title": "Unmodified title",
+    "content": "Source and limitations followed by each nonempty CSV field with its original field name and value",
+    "url": "https://www.goodreads.com/book/show/{goodreads_book_id}",
+    "url_note": "URL constructed from the dataset's Goodreads ID; external page availability and identity have not been independently validated.",
+    "action": "mergeOrUpload",
+    "scope": "Upload or merge book documents into an existing index; no deletions, schema changes, service changes, or RBAC changes.",
+    "verification": "Check every upload result, then retrieve and compare all four mapped fields for every imported book using exact ID filters, plus representative exact-key GETs and an index-wide count.",
+    "importer": "deployment/import_books.py",
+    "live_report": "deployment/.artifacts/books-import.json"
+  }
+}

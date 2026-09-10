@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    <meta name="description" content="Compare Prompt and Hosted agent answers and Azure AI Search tool evidence with one shared question and separate histories.">
-    <title>Agent comparison · Azure AI Search</title>
+    <meta name="description" content="Compare Prompt and Hosted book recommendations grounded in the same Azure AI Search book catalog.">
+    <title>Book recommendations · Agent comparison</title>
     <link rel="stylesheet" href="/static/styles.css">
     <script src="/static/app.js" defer></script>
   </head>
@@ -17,7 +17,7 @@
           <div>
             <p class="eyebrow">Azure AI Search / Developer playground</p>
             <h1>Agent comparison</h1>
-            <p class="subtitle">One question. Two agents. Compare answers and search evidence.</p>
+            <p class="subtitle">One book catalog. Two agents. Recommendations grounded in Azure AI Search.</p>
           </div>
         </div>
         <button id="reset" class="button secondary" type="button">New comparison</button>
@@ -48,10 +48,10 @@
           </div>
           <label for="message">Your question</label>
           <textarea id="message" name="message" rows="2" maxlength="4000" required
-            placeholder="Ask a question about the demo search content…"
+            placeholder="Recommend three books by Agatha Christie and compare their indexed ratings…"
             aria-describedby="message-help character-count"></textarea>
           <div class="input-meta">
-            <span id="message-help">Follow-ups keep each agent’s successful history separate.</span>
+            <span id="message-help">Search by title or author. The catalog contains book metadata, not plot summaries. Each agent keeps its own history.</span>
             <span id="character-count">0 / 4,000</span>
           </div>
           <div class="composer-actions">
