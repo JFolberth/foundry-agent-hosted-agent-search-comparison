@@ -24,10 +24,12 @@ class Message(StrictModel):
 class History(StrictModel):
     prompt: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
     hosted: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
+    prompt_none: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
+    hosted_none: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
 
     @model_validator(mode="after")
     def total_content(self):
-        for messages in (self.prompt, self.hosted):
+        for messages in (self.prompt, self.hosted, self.prompt_none, self.hosted_none):
             if sum(len(m.content) for m in messages) > MAX_HISTORY_CHARS:
                 raise ValueError("History exceeds character limit")
         return self
@@ -36,6 +38,8 @@ class History(StrictModel):
 class Continuation(StrictModel):
     prompt: str | None = Field(default=None, min_length=40, max_length=64, pattern=r"^[\w-]+$")
     hosted: str | None = Field(default=None, min_length=40, max_length=64, pattern=r"^[\w-]+$")
+    prompt_none: str | None = Field(default=None, min_length=40, max_length=64, pattern=r"^[\w-]+$")
+    hosted_none: str | None = Field(default=None, min_length=40, max_length=64, pattern=r"^[\w-]+$")
 
 
 class CompareRequest(StrictModel):

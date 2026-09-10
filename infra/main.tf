@@ -67,12 +67,14 @@ module "workloads" {
   application_insights_connection_string = module.platform.application_insights_connection_string
   container_apps_environment_id          = module.platform.container_apps_environment_id
   hosted_agent_name                      = var.hosted_agent_name
+  hosted_agent_name_none                 = var.hosted_agent_name_none
   hosted_image                           = var.hosted_image
   location                               = var.location
   model_deployment_name                  = module.foundry.model_deployment_name
   name_token                             = local.name_token
   project_endpoint                       = module.foundry.project_endpoint
   prompt_agent_name                      = var.prompt_agent_name
+  prompt_agent_name_none                 = var.prompt_agent_name_none
   registry_login_server                  = module.platform.registry_login_server
   resource_group_id                      = module.platform.resource_group_id
   search_index_name                      = module.search.index_name

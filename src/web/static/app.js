@@ -5,15 +5,26 @@
   const MAX_HISTORY_MESSAGES = 20;
   const MAX_HISTORY_MESSAGE_LENGTH = 12000;
   const MAX_HISTORY_LENGTH = 24000;
-  const agents = ['prompt', 'hosted'];
+  // Single source of truth for which Foundry agent each panel calls, its
+  // underlying kind (server-orchestrated prompt vs. self-hosted container),
+  // and its baked-in reasoning effort. Panel ordering here drives the 2x2
+  // results grid: row 1 is the low-reasoning pair, row 2 is no-reasoning.
+  const AGENT_META = {
+    prompt: { kind: 'prompt', reasoningLabel: 'Prompt agent', mark: '01' },
+    hosted: { kind: 'hosted', reasoningLabel: 'Hosted agent', mark: '02' },
+    prompt_none: { kind: 'prompt', reasoningLabel: 'Prompt agent', mark: '03' },
+    hosted_none: { kind: 'hosted', reasoningLabel: 'Hosted agent', mark: '04' }
+  };
+  const agents = Object.keys(AGENT_META);
+  const isHosted = (agent) => AGENT_META[agent].kind === 'hosted';
   const form = document.getElementById('compare-form');
   const messageInput = document.getElementById('message');
   const submitButton = document.getElementById('submit');
   const resetButton = document.getElementById('reset');
   const status = document.getElementById('status');
   const formError = document.getElementById('form-error');
-  let history = { prompt: [], hosted: [] };
-  let continuation = { prompt: null, hosted: null };
+  let history = Object.fromEntries(agents.map((agent) => [agent, []]));
+  let continuation = Object.fromEntries(agents.map((agent) => [agent, null]));
   let pending = false;
 
   function element(tag, text, className) {
@@ -68,7 +79,7 @@
       ['UI invocation · App Insights operation / trace ID', result.trace_id],
       ['UI invocation span ID', result.span_id]
     ];
-    if (agent === 'hosted') {
+    if (isHosted(agent)) {
       identifiers.splice(2, 0, ['Hosted model response', result.model_response_id]);
       identifiers.push(
         ['Hosted runtime · App Insights operation / trace ID', result.hosted_runtime_trace_id],
@@ -83,7 +94,7 @@
       if (reported) {
         const copy = element('button', 'Copy', 'button secondary copy-id');
         copy.type = 'button';
-        copy.setAttribute('aria-label', `Copy ${label} for ${agent === 'prompt' ? 'Prompt agent' : 'Hosted agent'}`);
+        copy.setAttribute('aria-label', `Copy ${label} for ${AGENT_META[agent].reasoningLabel}`);
         copy.addEventListener('click', async () => {
           copy.disabled = true;
           feedback.textContent = `Copying ${label}…`;
@@ -115,7 +126,7 @@
       body.append(element('p', telemetryNote, 'evidence-note'));
     }
     const hostedTelemetryNote = safeText(result.hosted_runtime_telemetry_note);
-    if (agent === 'hosted' && hostedTelemetryNote.trim()) {
+    if (isHosted(agent) && hostedTelemetryNote.trim()) {
       body.append(element('p', `Hosted runtime telemetry: ${hostedTelemetryNote}`, 'evidence-note'));
     }
     body.append(feedback);
@@ -310,7 +321,7 @@
     document.getElementById('comparison-id').textContent = 'Comparison ID: pending';
     document.getElementById('last-question').hidden = false;
     document.getElementById('last-question-text').textContent = question;
-    status.textContent = 'Comparing both agents. Answers and tool evidence will appear when the server responds.';
+    status.textContent = 'Comparing all four agents. Answers and tool evidence will appear when the server responds.';
     for (const agent of agents) {
       setPanelState(agent, 'Working', 'working');
       document.getElementById(`${agent}-content`).replaceChildren(
@@ -335,12 +346,12 @@
         `Comparison ID: ${safeText(data.comparison_id) || 'Not reported'}`;
       const outcomes = agents.map((agent) => renderResult(agent, data[agent], question));
       const completed = outcomes.filter(Boolean).length;
-      status.textContent = completed === 2
-        ? 'Both answers are ready. Compare the responses and expand the tool evidence below.'
-        : completed === 1
-          ? 'One answer is ready; the other agent reported an error. Only the successful history was updated.'
-          : 'Neither agent completed the request. Both conversation histories are unchanged.';
-      if (completed === 2) {
+      status.textContent = completed === agents.length
+        ? 'All answers are ready. Compare the responses and expand the tool evidence below.'
+        : completed === 0
+          ? 'No agent completed the request. All conversation histories are unchanged.'
+          : `${completed} of ${agents.length} answers are ready. Agents that reported an error kept their prior history.`;
+      if (completed === agents.length) {
         messageInput.value = '';
         updateCount();
       }
@@ -365,8 +376,8 @@
 
   resetButton.addEventListener('click', () => {
     if (pending) return;
-    history = { prompt: [], hosted: [] };
-    continuation = { prompt: null, hosted: null };
+    history = Object.fromEntries(agents.map((agent) => [agent, []]));
+    continuation = Object.fromEntries(agents.map((agent) => [agent, null]));
     messageInput.value = '';
     updateCount();
     formError.hidden = true;
@@ -377,7 +388,7 @@
     for (const agent of agents) {
       setPanelState(agent, 'Ready');
       const empty = element('div', undefined, 'empty-state');
-      const mark = element('span', agent === 'prompt' ? '01' : '02', 'empty-mark');
+      const mark = element('span', AGENT_META[agent].mark, 'empty-mark');
       mark.setAttribute('aria-hidden', 'true');
       empty.append(
         mark,

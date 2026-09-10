@@ -37,6 +37,8 @@ class Settings(BaseModel):
     search_index: str
     prompt_agent: str
     hosted_agent: str
+    prompt_agent_none: str | None = None
+    hosted_agent_none: str | None = None
 
     @model_validator(mode="after")
     def validate_fixed_endpoints(self):
@@ -49,11 +51,13 @@ class Settings(BaseModel):
             or not re.fullmatch(r"/api/projects/[\w-]+/?", endpoint.path)
         ):
             raise ValueError("A fixed Azure Foundry project endpoint is required")
-        for name in (self.model_deployment, self.search_index, self.prompt_agent, self.hosted_agent):
+        agent_names = [self.prompt_agent, self.hosted_agent, self.prompt_agent_none, self.hosted_agent_none]
+        configured_agent_names = [name for name in agent_names if name is not None]
+        for name in (self.model_deployment, self.search_index, *configured_agent_names):
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
                 raise ValueError("Invalid configured resource name")
-        if self.prompt_agent == self.hosted_agent:
-            raise ValueError("Two distinct registered agent names are required")
+        if len(set(configured_agent_names)) != len(configured_agent_names):
+            raise ValueError("All configured registered agent names must be distinct")
         if not re.fullmatch(
             r"/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.CognitiveServices/"
             r"accounts/[^/]+/projects/[^/]+/connections/[^/]+",
@@ -72,7 +76,17 @@ class Settings(BaseModel):
             "prompt_agent": "PROMPT_AGENT_NAME",
             "hosted_agent": "HOSTED_AGENT_NAME",
         }
-        return cls(**{key: os.environ[value] for key, value in names.items()})
+        values = {key: os.environ[value] for key, value in names.items()}
+        # Optional: only the web container registers the additional no-reasoning
+        # agents, so the hosted container's own environment need not supply them.
+        optional_names = {
+            "prompt_agent_none": "PROMPT_AGENT_NAME_NONE",
+            "hosted_agent_none": "HOSTED_AGENT_NAME_NONE",
+        }
+        for key, env_name in optional_names.items():
+            if env_name in os.environ:
+                values[key] = os.environ[env_name]
+        return cls(**values)
 
 
 def native_search_tool(settings: Settings, config: AgentConfig) -> AzureAISearchTool:
@@ -98,12 +112,25 @@ def prompt_definition(settings: Settings, config: AgentConfig) -> PromptAgentDef
     )
 
 
+def resolved_reasoning_effort(config: AgentConfig) -> str:
+    """The hosted container's own model call effort. Defaults to the canonical
+    agent.json value, but Terraform can register a second hosted agent that
+    reuses the SAME image with REASONING_EFFORT_OVERRIDE=none, so one image
+    serves both the low- and no-reasoning hosted registrations."""
+    override = os.environ.get("REASONING_EFFORT_OVERRIDE")
+    if override is None:
+        return config.reasoning_effort
+    if override not in ("low", "none"):
+        raise ValueError("REASONING_EFFORT_OVERRIDE must be 'low' or 'none'")
+    return override
+
+
 def model_options(settings: Settings, config: AgentConfig) -> dict:
     return {
         "model": settings.model_deployment,
         "instructions": config.instructions,
         "tools": [native_search_tool(settings, config).as_dict()],
-        "reasoning": {"effort": config.reasoning_effort},
+        "reasoning": {"effort": resolved_reasoning_effort(config)},
         "max_output_tokens": config.max_output_tokens,
         "store": False,
         "include": ["reasoning.encrypted_content"],

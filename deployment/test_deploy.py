@@ -49,7 +49,12 @@ def fixture():
         "project_id": PROJECT, "project_endpoint": ENDPOINT, "deploy_workloads": True,
         "prompt_agent_name": "search-prompt", "prompt_agent_version": "1",
         "hosted_agent_name": "search-hosted", "hosted_agent_version": "2",
-        "workload_agent_names": {"prompt": "search-prompt", "hosted": "search-hosted"},
+        "prompt_none_agent_name": "search-prompt-none", "prompt_none_agent_version": "1",
+        "hosted_none_agent_name": "search-hosted-none", "hosted_none_agent_version": "2",
+        "workload_agent_names": {
+            "prompt": "search-prompt", "hosted": "search-hosted",
+            "prompt_none": "search-prompt-none", "hosted_none": "search-hosted-none",
+        },
         "search_service_id": SEARCH, "search_endpoint": "https://example-search.search.windows.net",
         "search_index_name": "documents",
     }
@@ -71,7 +76,17 @@ def fixture():
                 "MODEL_DEPLOYMENT_NAME": "gpt-5-mini", "SEARCH_INDEX_NAME": "documents",
                 "SEARCH_PROJECT_CONNECTION_ID": PROJECT + "/connections/native-search",
                 "HOSTED_AGENT_NAME": "search-hosted", "PROMPT_AGENT_NAME": "search-prompt",
+                "REASONING_EFFORT_OVERRIDE": "low",
             },
+        },
+    }
+    definitions["prompt_none"] = {
+        **copy.deepcopy(definitions["prompt"]), "reasoning": {"effort": "none"},
+    }
+    definitions["hosted_none"] = {
+        **copy.deepcopy(definitions["hosted"]),
+        "environment_variables": {
+            **definitions["hosted"]["environment_variables"], "REASONING_EFFORT_OVERRIDE": "none",
         },
     }
     resources = [
@@ -82,12 +97,12 @@ def fixture():
         )
     ]
     resources += [
-        {"address": f"module.workloads[0].azapi_data_plane_resource.{kind}", "mode": "managed",
-         "values": {"name": outputs[f"{kind}_agent_name"],
+        {"address": f"module.workloads[0].azapi_data_plane_resource.{side}", "mode": "managed",
+         "values": {"name": outputs[f"{side}_agent_name"],
                     "parent_id": ENDPOINT.removeprefix("https://"), "type": "Microsoft.Foundry/agents@v1",
-                    "output": {"agent_version": outputs[f"{kind}_agent_version"]},
-                    "body": {"name": outputs[f"{kind}_agent_name"], "definition": definition}}}
-        for kind, definition in definitions.items()
+                    "output": {"agent_version": outputs[f"{side}_agent_version"]},
+                    "body": {"name": outputs[f"{side}_agent_name"], "definition": definition}}}
+        for side, definition in definitions.items()
     ]
     values = {"outputs": {key: {"value": value} for key, value in outputs.items()},
               "root_module": {"child_modules": [{"resources": resources}]}}
@@ -238,7 +253,9 @@ class DefinitionTests(unittest.TestCase):
 
     def test_typed_managed_projection_ignores_service_defaults(self):
         _, _, _, targets = fixture()
-        for kind, definition in targets["definitions"].items():
+        for side, definition in targets["definitions"].items():
+            kind = deploy.AGENT_SIDES[side]["kind"]
+            reasoning = deploy.AGENT_SIDES[side]["reasoning"]
             actual = copy.deepcopy(definition)
             actual["id"] = "read-only"
             actual["created_at"] = 123
@@ -248,7 +265,57 @@ class DefinitionTests(unittest.TestCase):
                 actual["protocol_versions"][0]["server_metadata"] = True
             else:
                 actual["reasoning"]["summary"] = "auto"
-            self.assertEqual(deploy.managed_definition(actual, kind), definition)
+            self.assertEqual(deploy.managed_definition(actual, kind, reasoning), definition)
+
+    def test_hosted_environment_rejects_unexpected_extra_keys(self):
+        _, _, _, targets = fixture()
+        definition = copy.deepcopy(targets["definitions"]["hosted"])
+        definition["environment_variables"]["UNEXPECTED_EXTRA"] = "value"
+        with self.assertRaisesRegex(deploy.DeploymentError, "approved keys"):
+            deploy.managed_definition(definition, "hosted", "low")
+
+    def test_hosted_environment_rejects_missing_expected_keys(self):
+        _, _, _, targets = fixture()
+        definition = copy.deepcopy(targets["definitions"]["hosted"])
+        del definition["environment_variables"]["SEARCH_INDEX_NAME"]
+        with self.assertRaisesRegex(deploy.DeploymentError, "approved keys"):
+            deploy.managed_definition(definition, "hosted", "low")
+
+    def test_none_variant_drift_beyond_reasoning_is_refused(self):
+        _, _, _, targets = fixture()
+        definitions = copy.deepcopy(targets["definitions"])
+        definitions["prompt_none"]["instructions"] = "Drifted instructions not present on prompt."
+        with self.assertRaisesRegex(deploy.DeploymentError, "must be identical to prompt"):
+            deploy.require_paired_reasoning_only_diff(definitions)
+
+    def test_hosted_none_drift_beyond_reasoning_override_is_refused(self):
+        _, _, _, targets = fixture()
+        definitions = copy.deepcopy(targets["definitions"])
+        definitions["hosted_none"]["cpu"] = "2"
+        with self.assertRaisesRegex(deploy.DeploymentError, "must be identical to hosted"):
+            deploy.require_paired_reasoning_only_diff(definitions)
+
+    def test_hosted_none_image_mismatch_is_refused(self):
+        _, _, _, targets = fixture()
+        definitions = copy.deepcopy(targets["definitions"])
+        definitions["hosted_none"]["container_configuration"]["image"] = (
+            "exampleacr.azurecr.io/other@sha256:" + "b" * 64
+        )
+        with self.assertRaisesRegex(deploy.DeploymentError, "must be identical to hosted"):
+            deploy.require_paired_reasoning_only_diff(definitions)
+
+    def test_properly_paired_definitions_are_accepted(self):
+        _, _, _, targets = fixture()
+        deploy.require_paired_reasoning_only_diff(copy.deepcopy(targets["definitions"]))
+
+    def test_applied_targets_enforces_pairing(self):
+        session, _, values, _ = fixture()
+        resources = values["root_module"]["child_modules"][0]["resources"]
+        for resource in resources:
+            if resource["address"].endswith(".prompt_none"):
+                resource["values"]["body"]["definition"]["instructions"] = "Drifted."
+        with self.assertRaisesRegex(deploy.DeploymentError, "must be identical to prompt"):
+            deploy.applied_targets(session)
 
     def test_exact_versions_compare_all_managed_fields(self):
         mutations = [
@@ -343,7 +410,8 @@ class RoutingTests(unittest.TestCase):
 
         with (patch.object(deploy, "confirm_project") as project,
               patch.object(deploy, "active_versions", side_effect=[[], deploy.DeploymentError("definition changed")]),
-              patch.object(deploy, "current_routes", return_value=({"prompt": {}, "hosted": {}}, {})),
+              patch.object(deploy, "current_routes", return_value=(
+                  {side: {} for side in deploy.AGENT_SIDES}, {})),
               patch.object(deploy, "private_dir", side_effect=lambda path: path),
               patch.object(deploy, "write_json", side_effect=write),
               patch.object(deploy, "read_json", side_effect=lambda path: saved[path]),
@@ -359,7 +427,7 @@ class RoutingTests(unittest.TestCase):
     def test_second_patch_rechecks_definitions_and_refuses_changed_version(self):
         session, _, _, targets = fixture()
         saved = {}
-        routes = {"prompt": {}, "hosted": {}}
+        routes = {side: {} for side in deploy.AGENT_SIDES}
         first_result = {"state": "enabled", "agent_endpoint": deploy.desired_route("1")}
 
         def write(path, value):
@@ -388,11 +456,12 @@ class RoutingTests(unittest.TestCase):
         session, _, _, targets = fixture()
 
         def response(_session, _endpoint, path, **kwargs):
-            kind = "prompt" if "search-prompt" in path else "hosted"
-            agent = targets["agents"][kind]
+            side = next(s for s in ("prompt_none", "hosted_none", "prompt", "hosted")
+                        if targets["agents"][s]["name"] in path)
+            agent = targets["agents"][side]
             if "/versions/" in path:
                 return {"version": agent["version"], "status": "active",
-                        "definition": targets["definitions"][kind]}
+                        "definition": targets["definitions"][side]}
             return {"state": "enabled", "agent_endpoint": deploy.desired_route(agent["version"])}
 
         with (patch.object(deploy, "confirm_project") as project,
@@ -400,7 +469,7 @@ class RoutingTests(unittest.TestCase):
               patch("sys.stdout", new_callable=io.StringIO)):
             deploy.verify(session)
         project.assert_called_once()
-        self.assertEqual(request.call_count, 4)
+        self.assertEqual(request.call_count, 8)
         self.assertTrue(all("patch" not in call.kwargs for call in request.call_args_list))
 
 
@@ -410,7 +479,7 @@ class PermissionReadinessTests(unittest.TestCase):
         with (patch.object(deploy, "confirm_project"),
               patch.object(deploy, "azure_request", side_effect=search or [{"value": []}, {}]) as search_request,
               patch.object(deploy, "foundry_request",
-                           side_effect=agents or [{"data": []}, http_error(404), http_error(404)]) as agent_request,
+                           side_effect=agents or [{"data": []}] + [http_error(404)] * 4) as agent_request,
               patch.object(deploy.time, "sleep") as sleep,
               patch("sys.stdout", new_callable=io.StringIO)):
             deploy.permission_readiness(session, timeout=seconds)
@@ -419,7 +488,8 @@ class PermissionReadinessTests(unittest.TestCase):
     def test_transient_forbidden_retries_then_success_and_absent_agents(self):
         search, agents, sleep = self.run_readiness(
             search=[http_error(403), {"value": []}, http_error(404)],
-            agents=[http_error(403), {"data": []}, http_error(403), http_error(404), {}])
+            agents=[http_error(403), {"data": []}, http_error(403), http_error(404), {},
+                    http_error(404), http_error(404)])
         self.assertEqual(sleep.call_count, 3)
         self.assertIn("/indexes?$select=name&api-version=2024-07-01", search.call_args_list[0].args[1])
         self.assertEqual(search.call_args_list[0].args[2], "https://search.azure.com")
@@ -460,15 +530,16 @@ class PermissionReadinessTests(unittest.TestCase):
         session, _, values, _ = fixture()
         del values["outputs"]["workload_agent_names"]
         values["outputs"]["deploy_workloads"]["value"] = False
-        for kind in ("prompt", "hosted"):
-            values["outputs"][f"{kind}_agent_version"]["value"] = None
+        for side in deploy.AGENT_SIDES:
+            values["outputs"][f"{side}_agent_version"]["value"] = None
         values["root_module"]["child_modules"][0]["resources"] = [
             resource for resource in values["root_module"]["child_modules"][0]["resources"]
             if not resource["address"].startswith("module.workloads[")
         ]
         with (patch.object(deploy, "confirm_project"),
               patch.object(deploy, "azure_request", side_effect=[{"value": []}, http_error(404)]),
-              patch.object(deploy, "foundry_request", side_effect=[{"data": []}, http_error(404), http_error(404)]),
+              patch.object(deploy, "foundry_request",
+                           side_effect=[{"data": []}] + [http_error(404)] * 4),
               patch("sys.stdout", new_callable=io.StringIO)):
             deploy.permission_readiness(session)
         session.tf.assert_not_called()
@@ -486,7 +557,7 @@ class PermissionReadinessTests(unittest.TestCase):
         session.state.side_effect = [values, {}]
         with (patch.object(deploy, "confirm_project"),
               patch.object(deploy, "azure_request", side_effect=[{"value": []}, {}]),
-              patch.object(deploy, "foundry_request", side_effect=[{"data": []}, {}, {}]),
+              patch.object(deploy, "foundry_request", side_effect=[{"data": []}, {}, {}, {}, {}]),
               patch("sys.stdout", new_callable=io.StringIO),
               self.assertRaisesRegex(deploy.DeploymentError, "changed")):
             deploy.permission_readiness(session)
@@ -554,6 +625,8 @@ class WorkloadPlanTests(unittest.TestCase):
         session, plan = self.plan()
         for address in ("module.workloads[0].azapi_data_plane_resource.prompt",
                         "module.workloads[0].azapi_data_plane_resource.hosted",
+                        "module.workloads[0].azapi_data_plane_resource.prompt_none",
+                        "module.workloads[0].azapi_data_plane_resource.hosted_none",
                         "module.workloads[0].azapi_resource.web"):
             plan["resource_changes"].append({"mode": "managed", "address": address,
                                              "change": {"actions": ["create"]}})

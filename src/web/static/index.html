@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    <meta name="description" content="Compare Prompt and Hosted book recommendations grounded in the same Azure AI Search book catalog.">
+    <meta name="description" content="Compare Prompt and Hosted book recommendations, each at low and no reasoning, grounded in the same Azure AI Search book catalog.">
     <title>Book recommendations · Agent comparison</title>
     <link rel="stylesheet" href="/static/styles.css">
     <script src="/static/app.js" defer></script>
@@ -17,7 +17,7 @@
           <div>
             <p class="eyebrow">Azure AI Search / Developer playground</p>
             <h1>Agent comparison</h1>
-            <p class="subtitle">One book catalog. Two agents. Recommendations grounded in Azure AI Search.</p>
+            <p class="subtitle">One book catalog. Four agents. Recommendations grounded in Azure AI Search.</p>
           </div>
         </div>
         <button id="reset" class="button secondary" type="button">New comparison</button>
@@ -28,9 +28,9 @@
         <details class="privacy-details">
           <summary>How your data is handled</summary>
           <div class="privacy-content">
-            <p>Your question is sent to both agents through the server, without sign-in.</p>
-            <p><strong>Prompt agent:</strong> Foundry stores its conversation and responses.</p>
-            <p><strong>Hosted agent:</strong> replays its browser-held history on each turn with
+            <p>Your question is sent to all four agents through the server, without sign-in.</p>
+            <p><strong>Prompt agents:</strong> Foundry stores their conversations and responses.</p>
+            <p><strong>Hosted agents:</strong> replay their browser-held history on each turn with
               <code>store=False</code>, rather than using a stored conversation for follow-ups.
               This is not a guarantee of zero service-side retention.</p>
             <p>Starting a new comparison clears browser histories and continuation tokens.
@@ -43,7 +43,7 @@
       <section class="composer-card" aria-labelledby="composer-heading">
         <form id="compare-form">
           <div class="composer-heading">
-            <h2 id="composer-heading">Ask both agents</h2>
+            <h2 id="composer-heading">Ask all four agents</h2>
             <span class="badge">Same question · Separate histories</span>
           </div>
           <label for="message">Your question</label>
@@ -55,13 +55,6 @@
             <span id="character-count">0 / 4,000</span>
           </div>
           <div class="composer-actions">
-            <div class="reasoning-control">
-              <label for="reasoning">Reasoning effort</label>
-              <select id="reasoning" disabled aria-describedby="reasoning-help">
-                <option value="low" selected>Low</option>
-              </select>
-              <span id="reasoning-help">Fixed to low for this demo</span>
-            </div>
             <button id="submit" class="button primary" type="submit">Compare answers <span aria-hidden="true">↗</span></button>
           </div>
           <p id="form-error" class="form-error" role="alert" hidden></p>
@@ -73,7 +66,7 @@
           <h2 id="comparison-heading">Responses</h2>
           <p id="comparison-id" class="comparison-id">Comparison ID: —</p>
         </div>
-        <p id="status" class="status" role="status" aria-live="polite" aria-atomic="true">Send a question to compare both agents.</p>
+        <p id="status" class="status" role="status" aria-live="polite" aria-atomic="true">Send a question to compare all four agents.</p>
         <div id="last-question" class="last-question" hidden>
           <h3>Latest question</h3>
           <p id="last-question-text"></p>
@@ -81,7 +74,7 @@
         <div class="results">
           <article id="prompt-panel" class="agent-panel" aria-labelledby="prompt-heading" aria-busy="false">
             <header class="panel-header">
-              <div><p class="eyebrow">01 / Prompt</p><h3 id="prompt-heading">Prompt agent</h3><p class="panel-description">Foundry-managed conversation</p></div>
+              <div><p class="eyebrow">01 / Prompt · Low reasoning</p><h3 id="prompt-heading">Prompt agent</h3><p class="panel-description">Foundry-managed conversation</p></div>
               <span id="prompt-state" class="state">Ready</span>
             </header>
             <div id="prompt-content" class="panel-content">
@@ -94,12 +87,38 @@
           </article>
           <article id="hosted-panel" class="agent-panel" aria-labelledby="hosted-heading" aria-busy="false">
             <header class="panel-header">
-              <div><p class="eyebrow">02 / Hosted</p><h3 id="hosted-heading">Hosted agent</h3><p class="panel-description">Hosted runtime · Browser-history replay</p></div>
+              <div><p class="eyebrow">02 / Hosted · Low reasoning</p><h3 id="hosted-heading">Hosted agent</h3><p class="panel-description">Hosted runtime · Browser-history replay</p></div>
               <span id="hosted-state" class="state">Ready</span>
             </header>
             <div id="hosted-content" class="panel-content">
               <div class="empty-state">
                 <span class="empty-mark" aria-hidden="true">02</span>
+                <p class="empty-title">Ready for your question</p>
+                <p>Compare the answer, timing, and tokens.<br>Inspect citations and available search evidence below.</p>
+              </div>
+            </div>
+          </article>
+          <article id="prompt_none-panel" class="agent-panel" aria-labelledby="prompt_none-heading" aria-busy="false">
+            <header class="panel-header">
+              <div><p class="eyebrow">03 / Prompt · No reasoning</p><h3 id="prompt_none-heading">Prompt agent</h3><p class="panel-description">Foundry-managed conversation</p></div>
+              <span id="prompt_none-state" class="state">Ready</span>
+            </header>
+            <div id="prompt_none-content" class="panel-content">
+              <div class="empty-state">
+                <span class="empty-mark" aria-hidden="true">03</span>
+                <p class="empty-title">Ready for your question</p>
+                <p>Compare the answer, timing, and tokens.<br>Inspect citations and available search evidence below.</p>
+              </div>
+            </div>
+          </article>
+          <article id="hosted_none-panel" class="agent-panel" aria-labelledby="hosted_none-heading" aria-busy="false">
+            <header class="panel-header">
+              <div><p class="eyebrow">04 / Hosted · No reasoning</p><h3 id="hosted_none-heading">Hosted agent</h3><p class="panel-description">Hosted runtime · Browser-history replay</p></div>
+              <span id="hosted_none-state" class="state">Ready</span>
+            </header>
+            <div id="hosted_none-content" class="panel-content">
+              <div class="empty-state">
+                <span class="empty-mark" aria-hidden="true">04</span>
                 <p class="empty-title">Ready for your question</p>
                 <p>Compare the answer, timing, and tokens.<br>Inspect citations and available search evidence below.</p>
               </div>

@@ -4,6 +4,7 @@ import time
 
 from opentelemetry.propagate import inject
 
+from .agents import kind_of
 from .contracts import CompareRequest, MAX_TURNS, REQUEST_TIMEOUT
 from .diagnostics import failure, from_metadata, record_failure
 from .evidence import error_result, extract_evidence
@@ -17,14 +18,14 @@ def provider_id(value):
     return None
 
 
-def runtime_telemetry(raw, side):
+def runtime_telemetry(raw, kind):
     metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
     values = {}
     for key, length in (("trace_id", 32), ("span_id", 16)):
         name = f"hosted_runtime_{key}"
         value = metadata.get(name)
         values[name] = (
-            value if side == "hosted" and isinstance(value, str)
+            value if kind == "hosted" and isinstance(value, str)
             and re.fullmatch(f"[0-9a-f]{{{length}}}", value) and int(value, 16) else None
         )
     if not all(values.values()):
@@ -48,16 +49,18 @@ class ComparisonService:
         self.timeout = timeout
 
     async def compare(self, request: CompareRequest, comparison_id: str):
+        sides = tuple(self.clients)
         results = await asyncio.gather(*(
-            self._one(side, request, comparison_id) for side in ("prompt", "hosted")
+            self._one(side, request, comparison_id) for side in sides
         ))
-        return dict(zip(("prompt", "hosted"), results))
+        return dict(zip(sides, results))
 
     async def _one(self, side, request, comparison_id):
         started = time.perf_counter()
         conversation_id = None
         stage = "request.validate"
         diagnostic = None
+        kind = kind_of(side)
         with tracer.start_as_current_span(
             f"agent.{side}", record_exception=False, set_status_on_exception=False,
             attributes={"comparison.id": comparison_id, "comparison.side": side},
@@ -65,8 +68,8 @@ class ComparisonService:
             try:
                 token = getattr(request.continuation, side)
                 seed = []
-                if side == "hosted":
-                    seed = [m.model_dump() for m in request.history.hosted]
+                if kind == "hosted":
+                    seed = [m.model_dump() for m in getattr(request.history, side)]
                     turns = sum(item["role"] == "user" for item in seed)
                 elif token:
                     stage = "continuation"
@@ -88,7 +91,7 @@ class ComparisonService:
                 if carrier.get("traceparent"):
                     headers["x-client-traceparent"] = carrier["traceparent"]
                 async with asyncio.timeout(self.timeout):
-                    if side == "prompt" and conversation_id is None:
+                    if kind == "prompt" and conversation_id is None:
                         stage = "prompt.conversations.create"
                         try:
                             conversation = await self.clients[side].conversations.create(
@@ -99,44 +102,44 @@ class ComparisonService:
                         conversation_id = provider_id(conversation.id)
                         if conversation_id is None:
                             raise ConversationUnavailable()
-                    invocation = {"conversation": conversation_id} if side == "prompt" else {}
+                    invocation = {"conversation": conversation_id} if kind == "prompt" else {}
                     stage = f"{side}.responses.create"
                     response = await self.clients[side].responses.create(
-                        input=(seed if side == "hosted" else []) + [{"role": "user", "content": request.message}],
+                        input=(seed if kind == "hosted" else []) + [{"role": "user", "content": request.message}],
                         max_output_tokens=self.config.max_output_tokens,
                         include=["reasoning.encrypted_content"],
-                        store=side == "prompt", stream=False, extra_headers=dict(headers), **invocation,
+                        store=kind == "prompt", stream=False, extra_headers=dict(headers), **invocation,
                     )
                 stage = f"{side}.response.parse"
                 raw = response.model_dump(mode="json", exclude_unset=True, warnings=False)
                 reported = raw.get("conversation")
                 reported = reported.get("id") if isinstance(reported, dict) else reported
-                if side == "hosted":
+                if kind == "hosted":
                     reported = provider_id(reported)
                     conversation_id = reported
                 if reported is not None and reported != conversation_id:
                     result = error_result("Agent returned a different conversation. Reset before continuing.")
                 else:
-                    result = extract_evidence(raw, hosted=side == "hosted")
-                    result.update(runtime_telemetry(raw, side))
+                    result = extract_evidence(raw, hosted=kind == "hosted")
+                    result.update(runtime_telemetry(raw, kind))
                     if raw.get("status") != "completed":
                         result["error"] = "Agent response was incomplete or failed. Reset this conversation before retrying."
                         result["continuation"] = None
                         diagnostic = (
-                            from_metadata(raw) if side == "hosted" else None
+                            from_metadata(raw) if kind == "hosted" else None
                         ) or failure(
                             stage, kind="UpstreamIncomplete" if raw.get("status") == "incomplete" else "UpstreamFailed",
                             request=getattr(response, "_request_id", None),
                         )
-                    elif (side == "prompt" and conversation_id is None) or (
-                        side == "hosted" and result["response_id"] is None
+                    elif (kind == "prompt" and conversation_id is None) or (
+                        kind == "hosted" and result["response_id"] is None
                     ):
                         result["error"] = "Agent did not return a usable provider conversation continuation. Reset to continue."
                         result["continuation"] = None
                     else:
                         result["continuation"] = (
                             self.store.put(side, [], turns + 1, conversation_id=conversation_id)
-                            if side == "prompt" else None
+                            if kind == "prompt" else None
                         )
                 record_evidence(span, result, comparison_id)
             except ConversationUnavailable as exc:
@@ -160,15 +163,15 @@ class ComparisonService:
                 diagnostic = failure(stage, exc)
                 result = error_result("Agent request failed. Reset this conversation and check the comparison trace.")
             result["conversation_id"] = conversation_id
-            result["conversation_scope"] = "hosted_agent" if side == "hosted" else "agent"
+            result["conversation_scope"] = "hosted_agent" if kind == "hosted" else "agent"
             if conversation_id:
                 span.set_attribute("gen_ai.conversation.id", conversation_id)
             result["conversation_note"] = (
                 ("Provider-reported hosted conversation ID; history is supplied explicitly with each request."
-                 if side == "hosted" else "Actual agent-bound Foundry conversation; provider-managed history.")
+                 if kind == "hosted" else "Actual agent-bound Foundry conversation; provider-managed history.")
                 if conversation_id else (
                     "Hosted user/assistant history is resent with each request. Responses are not stored; no conversation ID was reported."
-                    if side == "hosted" else "No provider conversation ID is available; none was fabricated."
+                    if kind == "hosted" else "No provider conversation ID is available; none was fabricated."
                 )
             )
             result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)

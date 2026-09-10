@@ -6,7 +6,8 @@ from azure.ai.projects.aio import AIProjectClient
 from azure.ai.projects.models import PromptAgentDefinition
 from azure.core.credentials import AccessToken
 
-from comparison.config import load_config, model_options, native_search_tool, prompt_definition
+from comparison.config import Settings, load_config, model_options, native_search_tool, prompt_definition, \
+    resolved_reasoning_effort
 
 
 class Credential:
@@ -79,3 +80,61 @@ async def test_real_sdk_serialization_and_dedicated_routes(settings, raw_respons
 def test_settings_reject_arbitrary_destinations(settings, field, value):
     with pytest.raises(ValueError):
         type(settings).model_validate({**settings.model_dump(), field: value})
+
+
+def test_none_reasoning_agent_names_are_optional_and_validated(settings):
+    dump = settings.model_dump()
+    extended = Settings.model_validate({
+        **dump, "prompt_agent_none": "prompt-search-none", "hosted_agent_none": "hosted-search-none",
+    })
+    assert extended.prompt_agent_none == "prompt-search-none"
+    assert extended.hosted_agent_none == "hosted-search-none"
+    # Duplicate against any configured name, including the two low-reasoning agents, is refused.
+    with pytest.raises(ValueError):
+        Settings.model_validate({**dump, "prompt_agent_none": dump["hosted_agent"]})
+    with pytest.raises(ValueError):
+        Settings.model_validate({**dump, "hosted_agent_none": dump["prompt_agent"]})
+
+
+def test_settings_from_env_optional_none_agents(monkeypatch, settings):
+    env = {
+        "FOUNDRY_PROJECT_ENDPOINT": settings.project_endpoint,
+        "MODEL_DEPLOYMENT_NAME": settings.model_deployment,
+        "SEARCH_PROJECT_CONNECTION_ID": settings.search_connection_id,
+        "SEARCH_INDEX_NAME": settings.search_index,
+        "PROMPT_AGENT_NAME": settings.prompt_agent,
+        "HOSTED_AGENT_NAME": settings.hosted_agent,
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("PROMPT_AGENT_NAME_NONE", raising=False)
+    monkeypatch.delenv("HOSTED_AGENT_NAME_NONE", raising=False)
+    without_none = Settings.from_env()
+    assert without_none.prompt_agent_none is None
+    assert without_none.hosted_agent_none is None
+    monkeypatch.setenv("PROMPT_AGENT_NAME_NONE", "prompt-search-none")
+    monkeypatch.setenv("HOSTED_AGENT_NAME_NONE", "hosted-search-none")
+    with_none = Settings.from_env()
+    assert with_none.prompt_agent_none == "prompt-search-none"
+    assert with_none.hosted_agent_none == "hosted-search-none"
+
+
+def test_resolved_reasoning_effort_defaults_and_override(monkeypatch):
+    config = load_config()
+    monkeypatch.delenv("REASONING_EFFORT_OVERRIDE", raising=False)
+    assert resolved_reasoning_effort(config) == config.reasoning_effort == "low"
+    monkeypatch.setenv("REASONING_EFFORT_OVERRIDE", "none")
+    assert resolved_reasoning_effort(config) == "none"
+    monkeypatch.setenv("REASONING_EFFORT_OVERRIDE", "low")
+    assert resolved_reasoning_effort(config) == "low"
+    monkeypatch.setenv("REASONING_EFFORT_OVERRIDE", "high")
+    with pytest.raises(ValueError):
+        resolved_reasoning_effort(config)
+
+
+def test_model_options_honors_reasoning_override(settings, monkeypatch):
+    config = load_config()
+    monkeypatch.setenv("REASONING_EFFORT_OVERRIDE", "none")
+    assert model_options(settings, config)["reasoning"] == {"effort": "none"}
+    monkeypatch.delenv("REASONING_EFFORT_OVERRIDE", raising=False)
+    assert model_options(settings, config)["reasoning"] == {"effort": "low"}

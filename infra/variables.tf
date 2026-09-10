@@ -21,11 +21,25 @@ variable "hosted_agent_name" {
   type        = string
   default     = "search-hosted"
   nullable    = false
-  description = "Registered hosted agent name; must differ from the prompt agent."
+  description = "Registered hosted agent name (low reasoning); must differ from all other registered agent names."
 
   validation {
-    condition     = can(regex("^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", var.hosted_agent_name)) && var.hosted_agent_name != var.prompt_agent_name
+    condition = can(regex("^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", var.hosted_agent_name)) && length(distinct([
+      var.hosted_agent_name, var.prompt_agent_name, var.hosted_agent_name_none, var.prompt_agent_name_none
+    ])) == 4
     error_message = "Use a distinct 1-63 character alphanumeric name with internal hyphens only."
+  }
+}
+
+variable "hosted_agent_name_none" {
+  type        = string
+  default     = "search-hosted-none"
+  nullable    = false
+  description = "Registered hosted agent name (no reasoning); must differ from all other registered agent names."
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", var.hosted_agent_name_none))
+    error_message = "Use a 1-63 character alphanumeric name with internal hyphens only."
   }
 }
 
@@ -116,10 +130,22 @@ variable "prompt_agent_name" {
   type        = string
   default     = "search-prompt"
   nullable    = false
-  description = "Registered native Search prompt agent name."
+  description = "Registered native Search prompt agent name (low reasoning)."
 
   validation {
     condition     = can(regex("^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", var.prompt_agent_name))
+    error_message = "Use a 1-63 character alphanumeric name with internal hyphens only."
+  }
+}
+
+variable "prompt_agent_name_none" {
+  type        = string
+  default     = "search-prompt-none"
+  nullable    = false
+  description = "Registered native Search prompt agent name (no reasoning)."
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", var.prompt_agent_name_none))
     error_message = "Use a 1-63 character alphanumeric name with internal hyphens only."
   }
 }

@@ -2,6 +2,7 @@
 """Separately approved, saved-plan deployment. Python 3 standard library only."""
 
 import argparse
+import copy
 import datetime
 import getpass
 import hashlib
@@ -28,6 +29,15 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 PROJECT_SEARCH_ROLES = {
     "project_search_data": "8ebe5a00-799e-43f5-93ac-243d3dce84a7",
     "project_search_service": "7ca78c08-252a-4471-8644-bb5ff32d4ba0",
+}
+# Self-contained registry: this script never imports src/comparison (stdlib-only,
+# separately security-audited). Side is the Terraform resource local name; kind
+# is the actual Microsoft.Foundry/agents schema "kind" field.
+AGENT_SIDES = {
+    "prompt": {"kind": "prompt", "reasoning": "low"},
+    "hosted": {"kind": "hosted", "reasoning": "low"},
+    "prompt_none": {"kind": "prompt", "reasoning": "none"},
+    "hosted_none": {"kind": "hosted", "reasoning": "none"},
 }
 DOCKERIGNORE = """**
 !pyproject.toml
@@ -725,6 +735,8 @@ def workload_foundation_guard(plan):
         "module.search.azapi_data_plane_resource.index[0]",
         "module.workloads[0].azapi_data_plane_resource.prompt",
         "module.workloads[0].azapi_data_plane_resource.hosted",
+        "module.workloads[0].azapi_data_plane_resource.prompt_none",
+        "module.workloads[0].azapi_data_plane_resource.hosted_none",
         "module.workloads[0].azapi_resource.web",
     }
     for resource in plan.get("resource_changes", []):
@@ -879,17 +891,20 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
     require(planned.get("value") is (stage != "foundation"),
             "Root must output deploy_workloads with the planned stage value.")
     modules = [plan.get("planned_values", {}).get("root_module", {})]
+    planned_definitions = {}
     while modules:
         module = modules.pop()
         modules.extend(module.get("child_modules", []))
         for resource in module.get("resources", []):
             definition = (resource.get("values", {}).get("body") or {}).get("definition", {})
-            if (stage == "workloads" and resource.get("address") in (
-                    "module.workloads[0].azapi_data_plane_resource.prompt",
-                    "module.workloads[0].azapi_data_plane_resource.hosted") and definition):
-                kind = resource["address"].rsplit(".", 1)[1]
-                require(managed_definition(definition, kind) == definition,
+            if (stage == "workloads" and resource.get("address") in {
+                    f"module.workloads[0].azapi_data_plane_resource.{side}" for side in AGENT_SIDES
+            } and definition):
+                side = resource["address"].rsplit(".", 1)[1]
+                require(managed_definition(definition, AGENT_SIDES[side]["kind"], AGENT_SIDES[side]["reasoning"])
+                        == definition,
                         "Saved plan contains unsupported managed definition fields; review the verifier first.")
+                planned_definitions[side] = definition
             if definition.get("kind") == "hosted":
                 require(
                     definition.get("protocol_versions") == [
@@ -899,6 +914,8 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
                     "Rebuild compatible images and create a fresh plan; "
                     "deprecated or legacy protocol configuration cannot be approved.",
                 )
+    if stage == "workloads":
+        require_paired_reasoning_only_diff(planned_definitions)
 
 
 def show_plan(session, binary):
@@ -1161,18 +1178,18 @@ def routing_targets(outputs, target):
     require(outputs.get("deploy_workloads") is True, "Workloads are not enabled in state.")
     project = project_target(outputs, target)
     agents = {}
-    for kind in ("prompt", "hosted"):
-        name, version = outputs.get(f"{kind}_agent_name"), outputs.get(f"{kind}_agent_version")
+    for side in AGENT_SIDES:
+        name, version = outputs.get(f"{side}_agent_name"), outputs.get(f"{side}_agent_version")
         for value in (name, version):
             require(isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_-][a-zA-Z0-9_.-]*", value),
-                    f"Missing/malformed exact {kind} agent name/version Terraform outputs.")
-        agents[kind] = {"name": name, "version": version}
-    require(agents["prompt"]["name"] != agents["hosted"]["name"],
-            "Prompt and hosted outputs must identify two distinct existing agents.")
+                    f"Missing/malformed exact {side} agent name/version Terraform outputs.")
+        agents[side] = {"name": name, "version": version}
+    require(len({agent["name"] for agent in agents.values()}) == len(agents),
+            "All four registered agent outputs must identify distinct existing agents.")
     return {**project, "deploy_workloads": True, "agents": agents}
 
 
-def managed_definition(definition, kind):
+def managed_definition(definition, kind, expected_reasoning="low"):
     """Typed projection of the schema this root manages, not service defaults."""
     require(isinstance(definition, dict) and definition.get("kind") == kind,
             "Missing/wrong agent definition kind.")
@@ -1194,7 +1211,8 @@ def managed_definition(definition, kind):
     if kind == "prompt":
         result = project(definition, {"kind": str, "model": str, "instructions": str,
                                      "reasoning": {"effort": str}, "tools": list})
-        require(result["reasoning"]["effort"] == "low", "Prompt reasoning effort must be low.")
+        require(result["reasoning"]["effort"] == expected_reasoning,
+                f"Prompt reasoning effort must be {expected_reasoning}.")
         require(len(result["tools"]) == 1, "Exactly one approved native Search tool is required.")
         tool = project(result["tools"][0], {"type": str, "azure_ai_search": {"indexes": list}})
         require(tool["type"] == "azure_ai_search" and len(tool["azure_ai_search"]["indexes"]) == 1,
@@ -1218,12 +1236,34 @@ def managed_definition(definition, kind):
     require(result["protocol_versions"] == [{"protocol": "responses", "version": "2.0.0"}],
             "Hosted version must implement Responses protocol 2.0.0.")
     environment = result["environment_variables"]
-    require(all(type(key) is str and type(value) is str for key, value in environment.items())
-            and all(environment.get(key) for key in (
-                "HOSTED_AGENT_NAME", "PROMPT_AGENT_NAME", "MODEL_DEPLOYMENT_NAME",
-                "SEARCH_INDEX_NAME", "SEARCH_PROJECT_CONNECTION_ID")),
-            "Missing/malformed hosted runtime environment.")
+    expected_env_keys = {
+        "HOSTED_AGENT_NAME", "PROMPT_AGENT_NAME", "MODEL_DEPLOYMENT_NAME",
+        "SEARCH_INDEX_NAME", "SEARCH_PROJECT_CONNECTION_ID", "REASONING_EFFORT_OVERRIDE",
+    }
+    require(set(environment) == expected_env_keys
+            and all(type(value) is str for value in environment.values())
+            and all(environment.get(key) for key in expected_env_keys - {"REASONING_EFFORT_OVERRIDE"})
+            and environment.get("REASONING_EFFORT_OVERRIDE") == expected_reasoning,
+            "Hosted runtime environment must contain exactly the approved keys with expected values.")
     return result
+
+
+def require_paired_reasoning_only_diff(definitions):
+    """Comparison validity depends on the low/none pairs differing ONLY by
+    reasoning effort (and, for hosted, by nothing else — including image).
+    Approve plans/applied state only when this parity actually holds."""
+    for base, none_side, kind in (("prompt", "prompt_none", "prompt"), ("hosted", "hosted_none", "hosted")):
+        if base not in definitions or none_side not in definitions:
+            continue
+        normalized_base = copy.deepcopy(definitions[base])
+        normalized_none = copy.deepcopy(definitions[none_side])
+        if kind == "prompt":
+            normalized_base["reasoning"]["effort"] = normalized_none["reasoning"]["effort"] = "normalized"
+        else:
+            normalized_base["environment_variables"]["REASONING_EFFORT_OVERRIDE"] = "normalized"
+            normalized_none["environment_variables"]["REASONING_EFFORT_OVERRIDE"] = "normalized"
+        require(normalized_base == normalized_none,
+                f"{none_side} must be identical to {base} except reasoning effort.")
 
 
 def state_resources(values):
@@ -1243,8 +1283,8 @@ def applied_targets(session):
     targets = routing_targets(outputs, session.target)
     resources = state_resources(values)
     definitions = {}
-    for kind, agent in targets["agents"].items():
-        resource = resources.get(f"module.workloads[0].azapi_data_plane_resource.{kind}", {})
+    for side, agent in targets["agents"].items():
+        resource = resources.get(f"module.workloads[0].azapi_data_plane_resource.{side}", {})
         body = resource.get("values", {})
         require(resource.get("mode") == "managed"
                 and body.get("type") == "Microsoft.Foundry/agents@v1"
@@ -1254,9 +1294,10 @@ def applied_targets(session):
                 and body.get("output", {}).get("agent_version") == agent["version"],
                 "Missing or mismatched applied Terraform agent resource.")
         approved = body["body"].get("definition")
-        definitions[kind] = managed_definition(approved, kind)
-        require(approved == definitions[kind],
+        definitions[side] = managed_definition(approved, AGENT_SIDES[side]["kind"], AGENT_SIDES[side]["reasoning"])
+        require(approved == definitions[side],
                 "Applied definition contains unmanaged fields; extend the reviewed verifier before routing.")
+    require_paired_reasoning_only_diff(definitions)
     targets["definitions"] = definitions
     return targets, outputs
 
@@ -1381,11 +1422,11 @@ def permission_readiness(session, timeout=600):
             "Search endpoint does not match the applied service ARM ID.")
     names = outputs.get("workload_agent_names")
     if names is None:
-        names = {kind: outputs.get(f"{kind}_agent_name") for kind in ("prompt", "hosted")}
-    require(isinstance(names, dict) and set(names) == {"prompt", "hosted"}
+        names = {side: outputs.get(f"{side}_agent_name") for side in AGENT_SIDES}
+    require(isinstance(names, dict) and set(names) == set(AGENT_SIDES)
             and all(isinstance(name, str) and re.fullmatch(r"[a-zA-Z0-9_-][a-zA-Z0-9_.-]*", name)
-                    for name in names.values()) and names["prompt"] != names["hosted"],
-            "Foundation must output both configured agent names (workload_agent_names or direct name outputs).")
+                    for name in names.values()) and len(set(names.values())) == len(names),
+            "Foundation must output all four configured agent names (workload_agent_names or direct name outputs).")
     index_name = outputs.get("search_index_name")
     require(isinstance(index_name, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]*", index_name),
             "Foundation must output a valid Search index name.")
@@ -1442,18 +1483,19 @@ def permission_readiness(session, timeout=600):
 
 def active_versions(session, targets, timeout=30):
     pending = []
-    for kind, agent in targets["agents"].items():
+    for side, agent in targets["agents"].items():
         data = foundry_request(session, targets["project_endpoint"], agent_path(agent, version=True),
                               timeout=timeout)
         require(data.get("version") == agent["version"],
                 "Exact version GET returned a different version.")
-        require(managed_definition(data.get("definition"), kind) == targets["definitions"][kind],
-                f"{kind.capitalize()} version definition differs from approved applied Terraform state; "
+        require(managed_definition(data.get("definition"), AGENT_SIDES[side]["kind"], AGENT_SIDES[side]["reasoning"])
+                == targets["definitions"][side],
+                f"{side.capitalize()} version definition differs from approved applied Terraform state; "
                 "refusing routing/verification.")
         require(data.get("status") not in ("failed", "deleting", "deleted"),
-                f"{kind.capitalize()} version failed or is deleting/deleted; inspect Foundry privately.")
+                f"{side.capitalize()} version failed or is deleting/deleted; inspect Foundry privately.")
         if data.get("status") != "active":
-            pending.append(kind)
+            pending.append(side)
     return pending
 
 

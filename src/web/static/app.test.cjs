@@ -8,7 +8,7 @@ const source = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 
 test('introduces metadata-grounded book recommendations without promising plot summaries', () => {
-  assert.match(html, /One book catalog\. Two agents\./);
+  assert.match(html, /One book catalog\. Four agents\./);
   assert.match(html, /Recommend three books by Agatha Christie/);
   assert.match(html, /book metadata, not plot summaries/);
 });
@@ -76,7 +76,8 @@ function result(overrides = {}) {
 }
 
 function response(prompt = result(), hosted = result(), extra = {}) {
-  return { ok: true, json: async () => ({ comparison_id: 'comparison-123', prompt, hosted, ...extra }) };
+  const { prompt_none = result(), hosted_none = result(), ...rest } = extra;
+  return { ok: true, json: async () => ({ comparison_id: 'comparison-123', prompt, hosted, prompt_none, hosted_none, ...rest }) };
 }
 
 function descendants(node) {
@@ -98,8 +99,8 @@ test('loads only same-origin external script and stylesheet without inline CSP e
 test('discloses different agent storage semantics and distinguishes local reset or token expiry from deletion', async () => {
   const notice = html.match(/<aside\b[^>]*>([\s\S]*?)<\/aside>/)[1].replace(/\s+/g, ' ');
   assert.match(notice, /Only use non-sensitive demo content/);
-  assert.match(notice, /Prompt agent:<\/strong> Foundry stores its conversation and responses/);
-  assert.match(notice, /Hosted agent:<\/strong> replays its browser-held history on each turn with <code>store=False<\/code>/);
+  assert.match(notice, /Prompt agents:<\/strong> Foundry stores their conversations and responses/);
+  assert.match(notice, /Hosted agents:<\/strong> replay their browser-held history on each turn with <code>store=False<\/code>/);
   assert.match(notice, /not a guarantee of zero service-side retention/);
   assert.match(notice, /Neither this reset nor expiry of the demo’s 20-minute continuation token deletes Foundry-stored prompt conversations or responses/);
   assert.doesNotMatch(notice, /stores conversations and responses for both agents/);
@@ -114,8 +115,8 @@ test('discloses different agent storage semantics and distinguishes local reset 
   assert.match(app.nodes.get('status').textContent, /Browser histories and continuation tokens cleared/);
   assert.match(app.nodes.get('status').textContent, /Foundry-stored prompt conversations and responses are not deleted/);
   await app.submit('New conversation');
-  assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [] });
-  assert.deepEqual(app.requests[1].body.continuation, { prompt: null, hosted: null });
+  assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [] });
+  assert.deepEqual(app.requests[1].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null });
 });
 
 test('discloses server-truncated output separately from tool evidence and text-history clipping', async () => {
@@ -148,21 +149,23 @@ test('uses one backend request, independently retains only successful history, a
   assert.equal(app.requests[0].method, 'POST');
   assert.deepEqual(app.requests[0].body, {
     message: 'First question',
-    history: { prompt: [], hosted: [] },
-    continuation: { prompt: null, hosted: null }
+    history: { prompt: [], hosted: [], prompt_none: [], hosted_none: [] },
+    continuation: { prompt: null, hosted: null, prompt_none: null, hosted_none: null }
   });
   assert.match(app.content('hosted'), /Agent unavailable/);
   assert.match(app.content('hosted'), /Partial answer/);
   await app.submit('Follow-up');
   assert.deepEqual(app.requests[1].body.history, {
     prompt: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'Prompt answer' }],
-    hosted: []
+    hosted: [],
+    prompt_none: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'An answer' }],
+    hosted_none: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'An answer' }]
   });
   assert.equal(app.nodes.get('comparison-id').textContent, 'Comparison ID: comparison-123');
   app.reset();
   assert.equal(app.nodes.get('last-question').hidden, true);
   await app.submit('Fresh question');
-  assert.deepEqual(app.requests[2].body.history, { prompt: [], hosted: [] });
+  assert.deepEqual(app.requests[2].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [] });
 });
 
 test('bounds each history to twenty messages without mixing agent answers', async () => {
@@ -202,7 +205,7 @@ test('enforces per-message and aggregate history character limits while retainin
   assert.equal(latest.history.prompt[1].content.length, 12000);
   assert.equal(latest.history.hosted.length, 4);
   assert.equal(latest.history.hosted[0].content, '2'.repeat(4000));
-  assert.deepEqual(latest.continuation, { prompt: 'prompt-3', hosted: 'hosted-3' });
+  assert.deepEqual(latest.continuation, { prompt: 'prompt-3', hosted: 'hosted-3', prompt_none: null, hosted_none: null });
   assert.ok(app.content('prompt').includes(longAnswer));
   assert.match(app.content('prompt'), /Only its first 12,000 characters are kept in text history/);
   assert.doesNotMatch(app.content('hosted'), /Only its first/);
@@ -222,7 +225,7 @@ test('expired continuation errors retain prior side state and display reset guid
   assert.match(app.content('prompt'), /Continuation expired. Start a new comparison/);
   assert.match(app.content('prompt'), /select New comparison/);
   await app.submit('Third');
-  assert.deepEqual(app.requests[2].body.continuation, { prompt: 'prompt-original', hosted: 'hosted-next' });
+  assert.deepEqual(app.requests[2].body.continuation, { prompt: 'prompt-original', hosted: 'hosted-next', prompt_none: null, hosted_none: null });
   assert.equal(app.requests[2].body.history.prompt.length, 2);
   assert.equal(app.requests[2].body.history.hosted.length, 4);
 });
@@ -350,7 +353,7 @@ test('reset restores both neutral empty states and removes previous evidence and
   const app = setup(() => response(result({ text: 'Previous answer', conversation_id: 'previous-id' })));
   await app.submit();
   app.reset();
-  for (const [agent, number] of [['prompt', '01'], ['hosted', '02']]) {
+  for (const [agent, number] of [['prompt', '01'], ['hosted', '02'], ['prompt_none', '03'], ['hosted_none', '04']]) {
     const empty = app.nodes.get(`${agent}-content`).children[0];
     assert.equal(empty.className, 'empty-state');
     assert.equal(empty.children[0].textContent, number);
@@ -655,7 +658,7 @@ test('handles network, HTTP, and invalid JSON failures in both panels without sa
     assert.equal(app.nodes.get('submit').disabled, false);
     assert.equal(app.nodes.get('message').value, 'Failed turn');
     await app.submit('Retry');
-    assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [] });
+    assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [] });
   }
 });
 
@@ -669,13 +672,17 @@ test('missing agent results do not discard the other successful answer', async (
   assert.equal(app.requests[1].body.history.hosted.length, 0);
 });
 
-test('reasoning effort is visibly fixed, disabled, and excluded from the request', async () => {
-  assert.match(html, /<select id="reasoning" disabled/);
-  assert.match(html, /<option value="low" selected>Low<\/option>/);
-  assert.match(html, /Fixed to low for this demo/);
+test('has no reasoning control; each panel labels its fixed reasoning effort and renders as a 2x2 grid', async () => {
+  assert.doesNotMatch(html, /id="reasoning"/);
+  assert.doesNotMatch(html, /reasoning-control/);
+  assert.match(html, /01 \/ Prompt · Low reasoning/);
+  assert.match(html, /02 \/ Hosted · Low reasoning/);
+  assert.match(html, /03 \/ Prompt · No reasoning/);
+  assert.match(html, /04 \/ Hosted · No reasoning/);
   const app = setup(() => response());
   await app.submit();
   assert.deepEqual(Object.keys(app.requests[0].body).sort(), ['continuation', 'history', 'message']);
+  assert.deepEqual(Object.keys(app.requests[0].body.history).sort(), ['hosted', 'hosted_none', 'prompt', 'prompt_none']);
 });
 
 test('sends opaque continuations independently, advances successful sides only, and clears both on reset', async () => {
@@ -692,19 +699,19 @@ test('sends opaque continuations independently, advances successful sides only, 
     return response(result({ continuation: 'prompt-latest' }), result({ continuation: 'hosted-next' }));
   });
   await app.submit('First');
-  assert.deepEqual(app.requests[0].body.continuation, { prompt: null, hosted: null });
+  assert.deepEqual(app.requests[0].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null });
   assert.equal(app.content('prompt').includes(promptToken), false);
   assert.equal(app.content('hosted').includes(hostedToken), false);
   await app.submit('Second');
-  assert.deepEqual(app.requests[1].body.continuation, { prompt: promptToken, hosted: hostedToken });
+  assert.deepEqual(app.requests[1].body.continuation, { prompt: promptToken, hosted: hostedToken, prompt_none: null, hosted_none: null });
   await app.submit('Third');
-  assert.deepEqual(app.requests[2].body.continuation, { prompt: 'prompt-next', hosted: hostedToken });
+  assert.deepEqual(app.requests[2].body.continuation, { prompt: 'prompt-next', hosted: hostedToken, prompt_none: null, hosted_none: null });
   assert.equal(app.requests[2].body.history.prompt.length, 4);
   assert.equal(app.requests[2].body.history.hosted.length, 2);
   app.reset();
   await app.submit('Fresh');
-  assert.deepEqual(app.requests[3].body.continuation, { prompt: null, hosted: null });
-  assert.deepEqual(app.requests[3].body.history, { prompt: [], hosted: [] });
+  assert.deepEqual(app.requests[3].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null });
+  assert.deepEqual(app.requests[3].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [] });
 });
 
 test('clears stale continuation when a successful response returns null, missing, or invalid values', async () => {
@@ -715,7 +722,7 @@ test('clears stale continuation when a successful response returns null, missing
     await app.submit('First');
     await app.submit('Second');
     await app.submit('Third');
-    assert.deepEqual(app.requests[2].body.continuation, { prompt: null, hosted: null });
+    assert.deepEqual(app.requests[2].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null });
     assert.equal(app.requests[2].body.history.prompt.length, 4);
     assert.equal(app.requests[2].body.history.hosted.length, 4);
   }
@@ -732,7 +739,7 @@ test('preserves prior continuations and histories after network failure or missi
   await app.submit('Missing answers');
   await app.submit('Retry');
   for (const request of app.requests.slice(1)) {
-    assert.deepEqual(request.body.continuation, { prompt: 'prompt-token', hosted: 'hosted-token' });
+    assert.deepEqual(request.body.continuation, { prompt: 'prompt-token', hosted: 'hosted-token', prompt_none: null, hosted_none: null });
     assert.equal(request.body.history.prompt.length, 2);
     assert.equal(request.body.history.hosted.length, 2);
   }

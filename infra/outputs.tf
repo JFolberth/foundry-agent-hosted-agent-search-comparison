@@ -49,6 +49,21 @@ output "hosted_agent_version" {
   value       = var.deploy_workloads ? module.workloads[0].hosted_agent_version : null
 }
 
+output "hosted_none_agent_identity_principal_id" {
+  description = "Platform-created hosted (no reasoning) identity object ID, possibly null until provisioning; never substitute the project managed identity."
+  value       = var.deploy_workloads ? module.workloads[0].hosted_none_agent_identity_principal_id : null
+}
+
+output "hosted_none_agent_name" {
+  description = "Registered hosted (no reasoning) agent name, null during foundation bootstrap."
+  value       = var.deploy_workloads ? module.workloads[0].hosted_none_agent_name : null
+}
+
+output "hosted_none_agent_version" {
+  description = "Exact hosted (no reasoning) version for routing, null during foundation bootstrap."
+  value       = var.deploy_workloads ? module.workloads[0].hosted_none_agent_version : null
+}
+
 output "location" {
   description = "Azure region shared by foundation resources."
   value       = var.location
@@ -92,6 +107,16 @@ output "prompt_agent_name" {
 output "prompt_agent_version" {
   description = "Exact prompt version for routing, null during foundation bootstrap."
   value       = var.deploy_workloads ? module.workloads[0].prompt_agent_version : null
+}
+
+output "prompt_none_agent_name" {
+  description = "Registered prompt (no reasoning) agent name, null during foundation bootstrap."
+  value       = var.deploy_workloads ? module.workloads[0].prompt_none_agent_name : null
+}
+
+output "prompt_none_agent_version" {
+  description = "Exact prompt (no reasoning) version for routing, null during foundation bootstrap."
+  value       = var.deploy_workloads ? module.workloads[0].prompt_none_agent_version : null
 }
 
 output "registry_id" {
@@ -167,7 +192,9 @@ output "ui_url" {
 output "workload_agent_names" {
   description = "Always-known configured names for authorization preflight GETs; does not imply agents exist."
   value = {
-    hosted = var.hosted_agent_name
-    prompt = var.prompt_agent_name
+    hosted      = var.hosted_agent_name
+    prompt      = var.prompt_agent_name
+    hosted_none = var.hosted_agent_name_none
+    prompt_none = var.prompt_agent_name_none
   }
 }

@@ -38,7 +38,13 @@ variable "container_apps_environment_id" {
 variable "hosted_agent_name" {
   type        = string
   nullable    = false
-  description = "Registered hosted agent name."
+  description = "Registered hosted agent name (low reasoning)."
+}
+
+variable "hosted_agent_name_none" {
+  type        = string
+  nullable    = false
+  description = "Registered hosted agent name (no reasoning); reuses the same hosted_image with REASONING_EFFORT_OVERRIDE=none."
 }
 
 variable "hosted_image" {
@@ -74,7 +80,13 @@ variable "project_endpoint" {
 variable "prompt_agent_name" {
   type        = string
   nullable    = false
-  description = "Registered prompt agent name, distinct from the hosted agent."
+  description = "Registered prompt agent name (low reasoning), distinct from the hosted agent."
+}
+
+variable "prompt_agent_name_none" {
+  type        = string
+  nullable    = false
+  description = "Registered prompt agent name (no reasoning), distinct from all other registered agent names."
 }
 
 variable "registry_login_server" {

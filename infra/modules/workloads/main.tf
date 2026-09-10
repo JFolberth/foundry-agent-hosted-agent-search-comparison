@@ -36,6 +36,42 @@ resource "azapi_data_plane_resource" "prompt" {
   }
 }
 
+# Second prompt registration: identical instructions/model/search tool, but
+# reasoning effort fixed to "none" for latency-critical/no-reasoning comparison.
+resource "azapi_data_plane_resource" "prompt_none" {
+  type      = "Microsoft.Foundry/agents@v1"
+  name      = var.prompt_agent_name_none
+  parent_id = local.project_host
+
+  body = {
+    name = var.prompt_agent_name_none
+    definition = {
+      kind         = "prompt"
+      model        = var.model_deployment_name
+      instructions = var.agent_config.instructions
+      reasoning    = { effort = "none" }
+      tools = [{
+        type = "azure_ai_search"
+        azure_ai_search = {
+          indexes = [{
+            project_connection_id = var.search_project_connection_id
+            index_name            = var.search_index_name
+            query_type            = var.agent_config.search_query_type
+            top_k                 = var.agent_config.search_top_k
+          }]
+        }
+      }]
+    }
+  }
+  response_export_values = local.agent_response_exports
+  retry                  = local.permission_retry
+
+  timeouts {
+    create = "30m"
+    update = "30m"
+  }
+}
+
 # Current contract automatically provisions on registration; there is NO start
 # action. AzAPI does not wait for status=active: deployment/deploy.py verifies
 # readiness separately. Its separately approved route-agents step selects the
@@ -62,7 +98,45 @@ resource "azapi_data_plane_resource" "hosted" {
       # FOUNDRY_PROJECT_ENDPOINT and APPLICATIONINSIGHTS_CONNECTION_STRING are
       # platform-injected. Never override reserved FOUNDRY_* or set AZURE_CLIENT_ID
       # to the project's MI: the sandbox has a separate platform agent identity.
-      environment_variables = local.runtime_environment
+      environment_variables = merge(local.runtime_environment, {
+        REASONING_EFFORT_OVERRIDE = "low"
+      })
+    }
+  }
+  response_export_values = local.agent_response_exports
+  retry                  = local.permission_retry
+
+  lifecycle {
+    precondition {
+      condition     = startswith(var.hosted_image, "${var.registry_login_server}/")
+      error_message = "The hosted image must be a real digest in this foundation's shared ACR."
+    }
+  }
+
+  timeouts {
+    create = "30m"
+    update = "30m"
+  }
+}
+
+# Same image, same infrastructure: only the reasoning override differs. This
+# keeps one built/pushed hosted image serving both hosted registrations.
+resource "azapi_data_plane_resource" "hosted_none" {
+  type      = "Microsoft.Foundry/agents@v1"
+  name      = var.hosted_agent_name_none
+  parent_id = local.project_host
+
+  body = {
+    name = var.hosted_agent_name_none
+    definition = {
+      kind                    = "hosted"
+      container_configuration = { image = var.hosted_image }
+      cpu                     = "1"
+      memory                  = "2Gi"
+      protocol_versions       = [{ protocol = "responses", version = "2.0.0" }]
+      environment_variables = merge(local.runtime_environment, {
+        REASONING_EFFORT_OVERRIDE = "none"
+      })
     }
   }
   response_export_values = local.agent_response_exports
@@ -131,10 +205,14 @@ resource "azapi_resource" "web" {
             [for key, value in merge(local.runtime_environment, {
               AZURE_CLIENT_ID          = var.ui_identity_client_id
               FOUNDRY_PROJECT_ENDPOINT = var.project_endpoint
+              PROMPT_AGENT_NAME_NONE   = var.prompt_agent_name_none
+              HOSTED_AGENT_NAME_NONE   = var.hosted_agent_name_none
               # Expected versions for runtime diagnostics. Actual dedicated
               # endpoint selection is managed by the approved route-agents step.
-              HOSTED_AGENT_VERSION = tostring(azapi_data_plane_resource.hosted.output.agent_version)
-              PROMPT_AGENT_VERSION = tostring(azapi_data_plane_resource.prompt.output.agent_version)
+              HOSTED_AGENT_VERSION      = tostring(azapi_data_plane_resource.hosted.output.agent_version)
+              PROMPT_AGENT_VERSION      = tostring(azapi_data_plane_resource.prompt.output.agent_version)
+              HOSTED_NONE_AGENT_VERSION = tostring(azapi_data_plane_resource.hosted_none.output.agent_version)
+              PROMPT_NONE_AGENT_VERSION = tostring(azapi_data_plane_resource.prompt_none.output.agent_version)
             }) : { name = key, value = value }],
             [{ name = "APPLICATIONINSIGHTS_CONNECTION_STRING", secretRef = "application-insights" }]
           )
