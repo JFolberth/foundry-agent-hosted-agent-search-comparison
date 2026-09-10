@@ -63,6 +63,7 @@ module "workloads" {
   count  = var.deploy_workloads ? 1 : 0
   source = "./modules/workloads"
 
+  account_id                             = module.foundry.account_id
   agent_config                           = local.agent_config
   application_insights_connection_string = module.platform.application_insights_connection_string
   container_apps_environment_id          = module.platform.container_apps_environment_id
@@ -70,7 +71,9 @@ module "workloads" {
   hosted_agent_name_none                 = var.hosted_agent_name_none
   hosted_image                           = var.hosted_image
   location                               = var.location
-  model_deployment_name                  = module.foundry.model_deployment_name
+  model_deployments                      = var.model_deployments
+  model_name                             = var.model_name
+  model_version                          = var.model_version
   name_token                             = local.name_token
   project_endpoint                       = module.foundry.project_endpoint
   prompt_agent_name                      = var.prompt_agent_name

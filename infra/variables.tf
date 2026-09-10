@@ -82,11 +82,30 @@ variable "model_deployment_name" {
   type        = string
   default     = "gpt-5.6-terra"
   nullable    = false
-  description = "Single account-level model deployment name passed to both agents."
+  description = "Legacy single account-level model deployment name/capacity kept in the foundry module for foundation-stage stability; no agent uses it anymore (each agent has its own dedicated deployment via model_deployments). Changing it requires a foundation-stage apply."
 
   validation {
     condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", var.model_deployment_name))
     error_message = "Use 1-64 letters, numbers, dots, underscores or hyphens, beginning with a letter or number."
+  }
+}
+
+variable "model_deployments" {
+  type = map(object({
+    name     = string
+    capacity = number
+  }))
+  nullable    = false
+  description = "Dedicated per-agent-side GlobalStandard model deployment name/capacity, keyed by prompt/prompt_none/hosted/hosted_none. Isolates each agent's TPM/RPM budget so concurrent calls from the other agents cannot skew one agent's latency; all four must have identical capacity so the comparison stays fair."
+
+  validation {
+    condition = (
+      toset(keys(var.model_deployments)) == toset(["prompt", "prompt_none", "hosted", "hosted_none"]) &&
+      length(distinct([for d in values(var.model_deployments) : d.name])) == 4 &&
+      length(distinct([for d in values(var.model_deployments) : d.capacity])) == 1 &&
+      alltrue([for d in values(var.model_deployments) : d.capacity >= 1 && d.capacity <= 1000 && floor(d.capacity) == d.capacity])
+    )
+    error_message = "Supply exactly prompt/prompt_none/hosted/hosted_none entries with four distinct names and one identical integer capacity (1-1000)."
   }
 }
 

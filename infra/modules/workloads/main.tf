@@ -1,3 +1,35 @@
+# Four dedicated per-agent model deployments (workload-scoped, not the single
+# account-level foundation deployment): isolates each agent's TPM/RPM budget so
+# concurrent calls from the other three agents cannot skew one agent's latency.
+# deploy.py's plan validator enforces that all four share model/version/capacity
+# and only the deployment name differs, keeping the comparison fair.
+resource "azapi_resource" "model" {
+  for_each  = var.model_deployments
+  type      = "Microsoft.CognitiveServices/accounts/deployments@2026-03-01"
+  name      = each.value.name
+  parent_id = var.account_id
+
+  body = {
+    sku = {
+      name     = "GlobalStandard"
+      capacity = each.value.capacity
+    }
+    properties = {
+      model = {
+        format  = "OpenAI"
+        name    = var.model_name
+        version = var.model_version
+      }
+      versionUpgradeOption = "NoAutoUpgrade"
+    }
+  }
+
+  timeouts {
+    create = "30m"
+    update = "30m"
+  }
+}
+
 # AzAPI 2.12 customizes this type to POST agents / POST agents/{name}; GET exports
 # come from the agent object, whose current version is versions.latest.version.
 # https://github.com/Azure/terraform-provider-azapi/blob/v2.12.0/internal/services/customization/foundry_agent_customization.go
@@ -11,7 +43,7 @@ resource "azapi_data_plane_resource" "prompt" {
     name = var.prompt_agent_name
     definition = {
       kind         = "prompt"
-      model        = var.model_deployment_name
+      model        = azapi_resource.model["prompt"].name
       instructions = var.agent_config.instructions
       reasoning    = { effort = var.agent_config.reasoning_effort }
       tools = [{
@@ -47,7 +79,7 @@ resource "azapi_data_plane_resource" "prompt_none" {
     name = var.prompt_agent_name_none
     definition = {
       kind         = "prompt"
-      model        = var.model_deployment_name
+      model        = azapi_resource.model["prompt_none"].name
       instructions = var.agent_config.instructions
       reasoning    = { effort = "none" }
       tools = [{
@@ -100,6 +132,7 @@ resource "azapi_data_plane_resource" "hosted" {
       # to the project's MI: the sandbox has a separate platform agent identity.
       environment_variables = merge(local.runtime_environment, {
         REASONING_EFFORT_OVERRIDE = "low"
+        MODEL_DEPLOYMENT_NAME     = azapi_resource.model["hosted"].name
       })
     }
   }
@@ -136,6 +169,7 @@ resource "azapi_data_plane_resource" "hosted_none" {
       protocol_versions       = [{ protocol = "responses", version = "2.0.0" }]
       environment_variables = merge(local.runtime_environment, {
         REASONING_EFFORT_OVERRIDE = "none"
+        MODEL_DEPLOYMENT_NAME     = azapi_resource.model["hosted_none"].name
       })
     }
   }
@@ -207,6 +241,10 @@ resource "azapi_resource" "web" {
               FOUNDRY_PROJECT_ENDPOINT = var.project_endpoint
               PROMPT_AGENT_NAME_NONE   = var.prompt_agent_name_none
               HOSTED_AGENT_NAME_NONE   = var.hosted_agent_name_none
+              # Validation/display only: routing for prompt/hosted is fixed at
+              # Terraform registration/per-resource env override, each using its
+              # OWN dedicated deployment (see azapi_resource.model above).
+              MODEL_DEPLOYMENT_NAME = azapi_resource.model["prompt"].name
               # Expected versions for runtime diagnostics. Actual dedicated
               # endpoint selection is managed by the approved route-agents step.
               HOSTED_AGENT_VERSION      = tostring(azapi_data_plane_resource.hosted.output.agent_version)

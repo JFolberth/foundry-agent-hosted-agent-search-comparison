@@ -60,7 +60,7 @@ def fixture():
     }
     definitions = {
         "prompt": {
-            "kind": "prompt", "model": "gpt-5-mini", "instructions": "Use only Search.",
+            "kind": "prompt", "model": "gpt-5-mini-prompt", "instructions": "Use only Search.",
             "reasoning": {"effort": "low"},
             "tools": [{"type": "azure_ai_search", "azure_ai_search": {"indexes": [{
                 "project_connection_id": PROJECT + "/connections/native-search",
@@ -73,7 +73,7 @@ def fixture():
             "cpu": "1", "memory": "2Gi",
             "protocol_versions": [{"protocol": "responses", "version": "2.0.0"}],
             "environment_variables": {
-                "MODEL_DEPLOYMENT_NAME": "gpt-5-mini", "SEARCH_INDEX_NAME": "documents",
+                "MODEL_DEPLOYMENT_NAME": "gpt-5-mini-hosted", "SEARCH_INDEX_NAME": "documents",
                 "SEARCH_PROJECT_CONNECTION_ID": PROJECT + "/connections/native-search",
                 "HOSTED_AGENT_NAME": "search-hosted", "PROMPT_AGENT_NAME": "search-prompt",
                 "REASONING_EFFORT_OVERRIDE": "low",
@@ -81,13 +81,18 @@ def fixture():
         },
     }
     definitions["prompt_none"] = {
-        **copy.deepcopy(definitions["prompt"]), "reasoning": {"effort": "none"},
+        **copy.deepcopy(definitions["prompt"]), "model": "gpt-5-mini-prompt-none", "reasoning": {"effort": "none"},
     }
     definitions["hosted_none"] = {
         **copy.deepcopy(definitions["hosted"]),
         "environment_variables": {
-            **definitions["hosted"]["environment_variables"], "REASONING_EFFORT_OVERRIDE": "none",
+            **definitions["hosted"]["environment_variables"],
+            "REASONING_EFFORT_OVERRIDE": "none", "MODEL_DEPLOYMENT_NAME": "gpt-5-mini-hosted-none",
         },
+    }
+    model_deployment_names = {
+        "prompt": "gpt-5-mini-prompt", "prompt_none": "gpt-5-mini-prompt-none",
+        "hosted": "gpt-5-mini-hosted", "hosted_none": "gpt-5-mini-hosted-none",
     }
     resources = [
         {"address": address, "values": {"id": resource_id}, "mode": "managed"}
@@ -104,11 +109,28 @@ def fixture():
                     "body": {"name": outputs[f"{side}_agent_name"], "definition": definition}}}
         for side, definition in definitions.items()
     ]
+    resources += [
+        {"address": f'module.workloads[0].azapi_resource.model["{side}"]', "mode": "managed",
+         "values": {"name": name,
+                    "body": {
+                        "sku": {"name": "GlobalStandard", "capacity": 80},
+                        "properties": {
+                            "model": {"format": "OpenAI", "name": "gpt-5.6-terra", "version": "2026-07-09"},
+                            "versionUpgradeOption": "NoAutoUpgrade",
+                        },
+                    }}}
+        for side, name in model_deployment_names.items()
+    ]
     values = {"outputs": {key: {"value": value} for key, value in outputs.items()},
               "root_module": {"child_modules": [{"resources": resources}]}}
     session = Mock(target=target, env={}, args=argparse.Namespace(timeout=60))
     session.state.return_value = values
-    targets = {**deploy.routing_targets(outputs, target), "definitions": definitions}
+    model_values = {
+        side: {"name": r["values"]["name"], "body": r["values"]["body"]}
+        for r in resources if r["address"].startswith('module.workloads[0].azapi_resource.model["')
+        for side in [r["address"].split('"')[1]]
+    }
+    targets = {**deploy.routing_targets(outputs, target), "definitions": definitions, "model_values": model_values}
     return session, outputs, values, targets
 
 
@@ -225,7 +247,7 @@ class DefinitionTests(unittest.TestCase):
             resource["values"].setdefault("output", {})["definition"] = {"instructions": "unapproved latest"}
         with patch.object(deploy, "infra_inputs", side_effect=AssertionError("must not read files")):
             actual, _ = deploy.applied_targets(session)
-        self.assertEqual(actual, targets)
+        self.assertEqual(actual, {k: v for k, v in targets.items() if k != "model_values"})
         proposal = deploy.prepare_routes(session.target, actual, {})
         changed = copy.deepcopy(proposal)
         changed["outputs"]["definitions"]["prompt"]["instructions"] = "unapproved"
@@ -234,13 +256,16 @@ class DefinitionTests(unittest.TestCase):
     def test_wrong_applied_resource_parent_or_name_is_rejected(self):
         for key in ("parent_id", "name"):
             session, _, values, _ = fixture()
-            values["root_module"]["child_modules"][0]["resources"][-1]["values"][key] = "other"
+            resources = values["root_module"]["child_modules"][0]["resources"]
+            agent_resource = next(r for r in resources if "azapi_data_plane_resource" in r["address"])
+            agent_resource["values"][key] = "other"
             with self.subTest(key=key), self.assertRaises(deploy.DeploymentError):
                 deploy.applied_targets(session)
 
     def test_unhandled_managed_state_fields_fail_closed(self):
         session, _, values, _ = fixture()
-        resource = values["root_module"]["child_modules"][0]["resources"][-1]
+        resources = values["root_module"]["child_modules"][0]["resources"]
+        resource = next(r for r in resources if "azapi_data_plane_resource" in r["address"])
         resource["values"]["body"]["definition"]["new_managed_setting"] = "must be reviewed"
         with self.assertRaisesRegex(deploy.DeploymentError, "unmanaged fields"):
             deploy.applied_targets(session)
@@ -307,6 +332,47 @@ class DefinitionTests(unittest.TestCase):
     def test_properly_paired_definitions_are_accepted(self):
         _, _, _, targets = fixture()
         deploy.require_paired_reasoning_only_diff(copy.deepcopy(targets["definitions"]))
+
+    def test_dedicated_models_missing_side_is_refused(self):
+        _, _, _, targets = fixture()
+        model_values = copy.deepcopy(targets["model_values"])
+        del model_values["hosted_none"]
+        with self.assertRaisesRegex(deploy.DeploymentError, "must be present"):
+            deploy.require_equivalent_dedicated_models(model_values)
+
+    def test_dedicated_models_duplicate_name_is_refused(self):
+        _, _, _, targets = fixture()
+        model_values = copy.deepcopy(targets["model_values"])
+        model_values["hosted_none"]["name"] = model_values["prompt"]["name"]
+        with self.assertRaisesRegex(deploy.DeploymentError, "distinct nonempty name"):
+            deploy.require_equivalent_dedicated_models(model_values)
+
+    def test_dedicated_models_capacity_mismatch_is_refused(self):
+        _, _, _, targets = fixture()
+        model_values = copy.deepcopy(targets["model_values"])
+        model_values["hosted"]["body"]["sku"]["capacity"] = 999
+        with self.assertRaisesRegex(deploy.DeploymentError, "must match model/version/capacity"):
+            deploy.require_equivalent_dedicated_models(model_values)
+
+    def test_dedicated_models_version_mismatch_is_refused(self):
+        _, _, _, targets = fixture()
+        model_values = copy.deepcopy(targets["model_values"])
+        model_values["prompt_none"]["body"]["properties"]["model"]["version"] = "2020-01-01"
+        with self.assertRaisesRegex(deploy.DeploymentError, "must match model/version/capacity"):
+            deploy.require_equivalent_dedicated_models(model_values)
+
+    def test_dedicated_models_equivalent_and_distinct_are_accepted(self):
+        _, _, _, targets = fixture()
+        deploy.require_equivalent_dedicated_models(copy.deepcopy(targets["model_values"]))
+
+    def test_applied_targets_enforces_dedicated_model_equivalence(self):
+        session, _, values, _ = fixture()
+        resources = values["root_module"]["child_modules"][0]["resources"]
+        for resource in resources:
+            if resource["address"] == 'module.workloads[0].azapi_resource.model["hosted_none"]':
+                resource["values"]["body"]["sku"]["capacity"] = 999
+        with self.assertRaisesRegex(deploy.DeploymentError, "must match model/version/capacity"):
+            deploy.applied_targets(session)
 
     def test_applied_targets_enforces_pairing(self):
         session, _, values, _ = fixture()
@@ -691,7 +757,8 @@ class WorkloadPlanTests(unittest.TestCase):
             session, plan = self.plan()
             _, _, values, _ = fixture()
             resources = values["root_module"]["child_modules"][0]["resources"]
-            resources[-2]["values"]["body"]["definition"][field] = value
+            agent_resource = next(r for r in resources if r["address"].endswith(".prompt"))
+            agent_resource["values"]["body"]["definition"][field] = value
             plan["planned_values"]["root_module"] = values["root_module"]
             with self.subTest(field=field), self.assertRaises(deploy.DeploymentError):
                 deploy.validate_plan(session, plan, "workloads",

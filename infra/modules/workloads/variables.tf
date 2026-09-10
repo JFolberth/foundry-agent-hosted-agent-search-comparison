@@ -1,3 +1,9 @@
+variable "account_id" {
+  type        = string
+  nullable    = false
+  description = "Foundry AIServices account ARM ID; parent for the four dedicated per-agent model deployments."
+}
+
 variable "agent_config" {
   type = object({
     instructions      = string
@@ -59,10 +65,35 @@ variable "location" {
   description = "Azure region for the UI Container App."
 }
 
-variable "model_deployment_name" {
+variable "model_deployments" {
+  type = map(object({
+    name     = string
+    capacity = number
+  }))
+  nullable    = false
+  description = "Dedicated per-agent-side GlobalStandard model deployment name/capacity, keyed by prompt/prompt_none/hosted/hosted_none. Each agent gets its own TPM/RPM budget so one agent's concurrent load cannot skew another's latency; all four must share model_name/model_version and have identical capacity so the comparison stays fair."
+
+  validation {
+    condition = (
+      toset(keys(var.model_deployments)) == toset(["prompt", "prompt_none", "hosted", "hosted_none"]) &&
+      length(distinct([for d in values(var.model_deployments) : d.name])) == 4 &&
+      length(distinct([for d in values(var.model_deployments) : d.capacity])) == 1 &&
+      alltrue([for d in values(var.model_deployments) : d.capacity >= 1 && d.capacity <= 1000 && floor(d.capacity) == d.capacity])
+    )
+    error_message = "Supply exactly prompt/prompt_none/hosted/hosted_none entries with four distinct names and one identical integer capacity (1-1000)."
+  }
+}
+
+variable "model_name" {
   type        = string
   nullable    = false
-  description = "Shared account model deployment name, not a model ARM ID."
+  description = "Verified OpenAI model catalog name, shared by all four dedicated deployments."
+}
+
+variable "model_version" {
+  type        = string
+  nullable    = false
+  description = "Explicit verified OpenAI model catalog version, shared by all four dedicated deployments."
 }
 
 variable "name_token" {

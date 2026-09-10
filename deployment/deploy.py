@@ -738,7 +738,7 @@ def workload_foundation_guard(plan):
         "module.workloads[0].azapi_data_plane_resource.prompt_none",
         "module.workloads[0].azapi_data_plane_resource.hosted_none",
         "module.workloads[0].azapi_resource.web",
-    }
+    } | {f'module.workloads[0].azapi_resource.model["{side}"]' for side in AGENT_SIDES}
     for resource in plan.get("resource_changes", []):
         actions = resource.get("change", {}).get("actions")
         if actions == ["no-op"] or (resource.get("mode") == "data" and actions == ["read"]):
@@ -892,6 +892,8 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
             "Root must output deploy_workloads with the planned stage value.")
     modules = [plan.get("planned_values", {}).get("root_module", {})]
     planned_definitions = {}
+    planned_models = {}
+    model_address = re.compile(r'^module\.workloads\[0\]\.azapi_resource\.model\["([^"]+)"\]$')
     while modules:
         module = modules.pop()
         modules.extend(module.get("child_modules", []))
@@ -905,6 +907,10 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
                         == definition,
                         "Saved plan contains unsupported managed definition fields; review the verifier first.")
                 planned_definitions[side] = definition
+            if stage == "workloads":
+                model_match = model_address.match(resource.get("address", ""))
+                if model_match:
+                    planned_models[model_match.group(1)] = resource.get("values", {}) or {}
             if definition.get("kind") == "hosted":
                 require(
                     definition.get("protocol_versions") == [
@@ -916,6 +922,7 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
                 )
     if stage == "workloads":
         require_paired_reasoning_only_diff(planned_definitions)
+        require_equivalent_dedicated_models(planned_models)
 
 
 def show_plan(session, binary):
@@ -1034,7 +1041,7 @@ def apply_stage(session):
     else:
         permission_readiness(session, timeout=getattr(session.args, "timeout", 600))
         unchanged()
-    session.tf("apply", "-input=false", "-no-color", "-lock-timeout=60s", str(binary),
+    session.tf("apply", "-input=false", "-no-color", "-lock-timeout=60s", "-parallelism=1", str(binary),
                log=binary.parent / "apply.log")
     write_json(binary.parent / "applied.json", {"sha256": record["sha256"], "stage": stage})
     print("Exact saved plan applied. Output/logs remain private. Readiness is checked separately with verify.")
@@ -1250,7 +1257,9 @@ def managed_definition(definition, kind, expected_reasoning="low"):
 
 def require_paired_reasoning_only_diff(definitions):
     """Comparison validity depends on the low/none pairs differing ONLY by
-    reasoning effort (and, for hosted, by nothing else — including image).
+    reasoning effort AND their dedicated model deployment name (each agent has
+    its own deployment to avoid cross-agent latency contention; equivalence of
+    those deployments is enforced separately by require_equivalent_dedicated_models).
     Approve plans/applied state only when this parity actually holds."""
     for base, none_side, kind in (("prompt", "prompt_none", "prompt"), ("hosted", "hosted_none", "hosted")):
         if base not in definitions or none_side not in definitions:
@@ -1259,11 +1268,44 @@ def require_paired_reasoning_only_diff(definitions):
         normalized_none = copy.deepcopy(definitions[none_side])
         if kind == "prompt":
             normalized_base["reasoning"]["effort"] = normalized_none["reasoning"]["effort"] = "normalized"
+            normalized_base["model"] = normalized_none["model"] = "normalized"
         else:
             normalized_base["environment_variables"]["REASONING_EFFORT_OVERRIDE"] = "normalized"
             normalized_none["environment_variables"]["REASONING_EFFORT_OVERRIDE"] = "normalized"
+            normalized_base["environment_variables"]["MODEL_DEPLOYMENT_NAME"] = "normalized"
+            normalized_none["environment_variables"]["MODEL_DEPLOYMENT_NAME"] = "normalized"
         require(normalized_base == normalized_none,
-                f"{none_side} must be identical to {base} except reasoning effort.")
+                f"{none_side} must be identical to {base} except reasoning effort and dedicated model deployment.")
+
+
+def require_equivalent_dedicated_models(model_values):
+    """Each of the four experiment-scoped model deployments (one per agent
+    side, isolating TPM/RPM budgets so agents cannot contend with each other)
+    must use the same verified model name/version/capacity and a distinct
+    deployment name. Isolation for fairness, not a difference in model or
+    capacity, is the only intended variation here."""
+    require(set(model_values) == set(AGENT_SIDES) or not model_values,
+            "All four dedicated per-agent model deployments must be present.")
+    if not model_values:
+        return
+    names = {side: value.get("name") for side, value in model_values.items()}
+    require(len(set(names.values())) == len(names) and all(names.values()),
+            "Each side's dedicated model deployment must have a distinct nonempty name.")
+    canon = None
+    for side, value in model_values.items():
+        body = value.get("body", {}) or {}
+        properties = body.get("properties", {}) or {}
+        model = properties.get("model", {}) or {}
+        sku = body.get("sku", {}) or {}
+        projected = {
+            "format": model.get("format"), "name": model.get("name"), "version": model.get("version"),
+            "sku_name": sku.get("name"), "capacity": sku.get("capacity"),
+            "versionUpgradeOption": properties.get("versionUpgradeOption"),
+        }
+        if canon is None:
+            canon = projected
+        require(projected == canon,
+                f"{side} model deployment must match model/version/capacity of the others.")
 
 
 def state_resources(values):
@@ -1298,6 +1340,11 @@ def applied_targets(session):
         require(approved == definitions[side],
                 "Applied definition contains unmanaged fields; extend the reviewed verifier before routing.")
     require_paired_reasoning_only_diff(definitions)
+    model_values = {
+        side: resources.get(f'module.workloads[0].azapi_resource.model["{side}"]', {}).get("values", {}) or {}
+        for side in AGENT_SIDES
+    }
+    require_equivalent_dedicated_models(model_values)
     targets["definitions"] = definitions
     return targets, outputs
 

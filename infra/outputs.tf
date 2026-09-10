@@ -75,8 +75,13 @@ output "log_analytics_workspace_id" {
 }
 
 output "model_deployment_name" {
-  description = "Single model deployment name to use for both agents."
+  description = "Legacy single account-level model deployment name; orphaned/unused now that each agent has its own dedicated deployment (see model_deployment_names)."
   value       = module.foundry.model_deployment_name
+}
+
+output "model_deployment_names" {
+  description = "Dedicated per-agent-side model deployment names (prompt, prompt_none, hosted, hosted_none), null during foundation bootstrap."
+  value       = var.deploy_workloads ? module.workloads[0].model_deployment_names : null
 }
 
 output "project_endpoint" {

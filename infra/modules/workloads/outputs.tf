@@ -48,6 +48,11 @@ output "prompt_none_agent_version" {
   value       = tostring(azapi_data_plane_resource.prompt_none.output.agent_version)
 }
 
+output "model_deployment_names" {
+  description = "Dedicated per-agent-side model deployment names (prompt, prompt_none, hosted, hosted_none); each agent uses its own to avoid cross-agent latency contention."
+  value       = { for side, deployment in azapi_resource.model : side => deployment.name }
+}
+
 output "ui_url" {
   description = "Anonymous public demo UI HTTPS URL. Only public documents belong in this demo."
   value       = "https://${azapi_resource.web.output.properties.configuration.ingress.fqdn}"

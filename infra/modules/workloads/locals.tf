@@ -1,8 +1,9 @@
 locals {
   project_host = trimsuffix(trimprefix(var.project_endpoint, "https://"), "/")
+  # MODEL_DEPLOYMENT_NAME is intentionally NOT shared here: each hosted/hosted_none
+  # resource and the web container set their own dedicated deployment name below.
   runtime_environment = {
     HOSTED_AGENT_NAME            = var.hosted_agent_name
-    MODEL_DEPLOYMENT_NAME        = var.model_deployment_name
     PROMPT_AGENT_NAME            = var.prompt_agent_name
     SEARCH_INDEX_NAME            = var.search_index_name
     SEARCH_PROJECT_CONNECTION_ID = var.search_project_connection_id
