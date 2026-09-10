@@ -1,5 +1,6 @@
 import asyncio
 import json
+from html.parser import HTMLParser
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -58,6 +59,37 @@ def test_web_routes_contract_and_safe_validation(raw_response):
         assert client.post(
             "/api/compare", content=b"x" * 65537, headers={"content-type": "application/json"},
         ).status_code == 413
+
+
+def test_web_page_referenced_assets_are_served(raw_response):
+    class PageAssets(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.assets = []
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "link" and attrs.get("rel") == "stylesheet":
+                self.assets.append((attrs["href"], "text/css"))
+            elif tag == "script" and "src" in attrs:
+                self.assets.append((attrs["src"], "javascript"))
+
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    with TestClient(create_app(ComparisonService(clients, load_config()))) as client:
+        page = client.get("/")
+        assert page.status_code == 200
+        assets = PageAssets()
+        assets.feed(page.text)
+        assert len(assets.assets) >= 2
+        for url, content_type in assets.assets:
+            assert url.startswith("/static/")
+            response = client.get(url)
+            assert response.status_code == 200, url
+            assert content_type in response.headers["content-type"]
+            assert response.content
+            assert response.headers["x-content-type-options"] == "nosniff"
+        assert client.get("/static/missing.css").status_code == 404
+        assert client.get("/api/config").status_code == 200
 
 
 async def test_hosted_protocol_preserves_native_items(settings, raw_response):

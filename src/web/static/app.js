@@ -52,10 +52,11 @@
   }
 
   function renderCorrelation(agent, result = {}) {
-    const section = element('section', undefined, 'diagnostics');
-    const heading = element('h4', 'Conversation & telemetry');
+    const section = element('details', undefined, 'diagnostics');
+    const heading = element('summary', 'Conversation & telemetry');
     heading.id = `${agent}-correlation-heading`;
     section.setAttribute('aria-labelledby', heading.id);
+    const body = element('div', undefined, 'diagnostics-body');
     const values = element('dl');
     const feedback = element('p', '', 'copy-status');
     feedback.setAttribute('role', 'status');
@@ -103,20 +104,21 @@
       item.append(element('dt', label), description);
       values.append(item);
     }
-    section.append(heading, values);
+    section.append(heading, body);
+    body.append(values);
     const conversationNote = safeText(result.conversation_note);
     if (conversationNote.trim()) {
-      section.append(element('p', conversationNote, 'evidence-note'));
+      body.append(element('p', conversationNote, 'evidence-note'));
     }
     const telemetryNote = safeText(result.telemetry_note);
     if (telemetryNote.trim()) {
-      section.append(element('p', telemetryNote, 'evidence-note'));
+      body.append(element('p', telemetryNote, 'evidence-note'));
     }
     const hostedTelemetryNote = safeText(result.hosted_runtime_telemetry_note);
     if (agent === 'hosted' && hostedTelemetryNote.trim()) {
-      section.append(element('p', `Hosted runtime telemetry: ${hostedTelemetryNote}`, 'evidence-note'));
+      body.append(element('p', `Hosted runtime telemetry: ${hostedTelemetryNote}`, 'evidence-note'));
     }
-    section.append(feedback);
+    body.append(feedback);
     return section;
   }
 
@@ -245,7 +247,7 @@
       content = showPanelError(agent, hasError ? result.error : 'No answer text was returned.', result);
     } else {
       content = document.getElementById(`${agent}-content`);
-      content.replaceChildren(renderCorrelation(agent, result));
+      content.replaceChildren();
       setPanelState(agent, 'Complete', 'success');
     }
     if (hasText) {
@@ -278,6 +280,7 @@
           'evidence-note'
         ));
       }
+      content.append(renderCorrelation(agent, result));
       continuation[agent] = typeof result.continuation === 'string' ? result.continuation : null;
       return true;
     }
@@ -363,12 +366,18 @@
     document.getElementById('comparison-id').textContent = 'Comparison ID: —';
     document.getElementById('last-question').hidden = true;
     document.getElementById('last-question-text').textContent = '';
-    status.textContent = 'Browser histories and continuation tokens cleared. Foundry-stored conversations and responses are not deleted. Start a new comparison.';
+    status.textContent = 'Browser histories and continuation tokens cleared. Foundry-stored prompt conversations and responses are not deleted. Start a new comparison.';
     for (const agent of agents) {
       setPanelState(agent, 'Ready');
-      document.getElementById(`${agent}-content`).replaceChildren(
-        element('p', 'An answer will appear here, alongside timing, token usage, citations, and available tool evidence.', 'empty-state')
+      const empty = element('div', undefined, 'empty-state');
+      const mark = element('span', agent === 'prompt' ? '01' : '02', 'empty-mark');
+      mark.setAttribute('aria-hidden', 'true');
+      empty.append(
+        mark,
+        element('p', 'Ready for your question', 'empty-title'),
+        element('p', 'Compare the answer, timing, and tokens.\nInspect citations and available search evidence below.')
       );
+      document.getElementById(`${agent}-content`).replaceChildren(empty);
     }
     messageInput.focus();
   });

@@ -113,6 +113,7 @@ def create_app(service=None):
 
     static = ROOT / "src/web/static"
     if static.is_dir():
+        app.mount("/static", StaticFiles(directory=static), name="assets")
         app.mount("/", StaticFiles(directory=static, html=True), name="static")
     return app
 

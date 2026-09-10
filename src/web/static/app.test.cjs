@@ -89,11 +89,16 @@ test('loads only same-origin external script and stylesheet without inline CSP e
   assert.doesNotMatch(css, /@import\b|url\s*\(/i);
 });
 
-test('discloses Foundry response storage and distinguishes local reset or token expiry from deletion', async () => {
+test('discloses different agent storage semantics and distinguishes local reset or token expiry from deletion', async () => {
   const notice = html.match(/<aside\b[^>]*>([\s\S]*?)<\/aside>/)[1].replace(/\s+/g, ' ');
   assert.match(notice, /Only use non-sensitive demo content/);
-  assert.match(notice, /Foundry stores conversations and responses for both agents/);
-  assert.match(notice, /Starting a new comparison or expiry of the demo’s 20-minute continuation token does not delete those stored conversations or responses/);
+  assert.match(notice, /Prompt agent:<\/strong> Foundry stores its conversation and responses/);
+  assert.match(notice, /Hosted agent:<\/strong> replays its browser-held history on each turn with <code>store=False<\/code>/);
+  assert.match(notice, /not a guarantee of zero service-side retention/);
+  assert.match(notice, /Neither this reset nor expiry of the demo’s 20-minute continuation token deletes Foundry-stored prompt conversations or responses/);
+  assert.doesNotMatch(notice, /stores conversations and responses for both agents/);
+  assert.ok(notice.indexOf('Only use non-sensitive demo content') < notice.indexOf('<details'));
+  assert.match(notice, /<details class="privacy-details"> <summary>How your data is handled<\/summary>/);
   const app = setup(() => response(
     result({ continuation: 'prompt-private' }), result({ continuation: 'hosted-private' })
   ));
@@ -101,7 +106,7 @@ test('discloses Foundry response storage and distinguishes local reset or token 
   app.reset();
   assert.equal(app.requests.length, 1);
   assert.match(app.nodes.get('status').textContent, /Browser histories and continuation tokens cleared/);
-  assert.match(app.nodes.get('status').textContent, /Foundry-stored conversations and responses are not deleted/);
+  assert.match(app.nodes.get('status').textContent, /Foundry-stored prompt conversations and responses are not deleted/);
   await app.submit('New conversation');
   assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [] });
   assert.deepEqual(app.requests[1].body.continuation, { prompt: null, hosted: null });
@@ -273,7 +278,7 @@ test('unavailable or missing evidence never becomes a zero count, including trun
   assert.match(app.content('prompt'), /At least 0 observed tool records/);
 });
 
-test('shows all correlation IDs as safe text in visible per-agent blocks even for failed results', async () => {
+test('keeps all correlation IDs as safe text in native expandable diagnostics even for failed results', async () => {
   const traceId = '<script>trace-id</script>';
   const app = setup(() => response(
     result({ conversation_id: 'prompt-conversation', trace_id: traceId, response_id: 'prompt-response', span_id: 'prompt-span', continuation: 'not-for-display' }),
@@ -282,8 +287,11 @@ test('shows all correlation IDs as safe text in visible per-agent blocks even fo
   await app.submit();
   for (const agent of ['prompt', 'hosted']) {
     const details = descendants(app.nodes.get(`${agent}-content`)).find((node) => node.className === 'diagnostics');
-    assert.equal(details.tagName, 'section');
+    assert.equal(details.tagName, 'details');
     assert.equal(details.hidden, false);
+    assert.equal(details.attributes.open, undefined);
+    assert.notEqual(details.open, true);
+    assert.equal(details.children[0].tagName, 'summary');
     assert.equal(details.children[0].textContent, 'Conversation & telemetry');
     assert.equal(details.attributes['aria-labelledby'], `${agent}-correlation-heading`);
     assert.match(details.textContent, /Foundry conversation/);
@@ -303,6 +311,50 @@ test('shows all correlation IDs as safe text in visible per-agent blocks even fo
   assert.doesNotMatch(app.content('prompt'), /hosted-trace|hosted-response|not-for-display/);
   app.reset();
   assert.doesNotMatch(app.content('prompt') + app.content('hosted'), /Conversation & telemetry|trace-id|hosted-trace/);
+});
+
+test('prioritizes answers and visible evidence over collapsed diagnostics without losing details', async () => {
+  const app = setup(() => response(
+    result({ conversation_id: 'prompt-conversation', tool_calls: [{ type: 'search', query: 'example' }] }),
+    result({ tool_evidence_available: false })
+  ));
+  await app.submit();
+  for (const agent of ['prompt', 'hosted']) {
+    const children = app.nodes.get(`${agent}-content`).children;
+    assert.equal(children[0].className, 'answer-section');
+    assert.equal(children.at(-1).className, 'diagnostics');
+    assert.equal(children.at(-1).tagName, 'details');
+    for (const name of ['metrics', 'evidence-section', 'citations-section']) {
+      const section = children.find((node) => node.className === name);
+      assert.ok(section, `${name} must remain outside collapsed diagnostics`);
+      assert.notEqual(section.tagName, 'details');
+      assert.equal(section.hidden, false);
+    }
+  }
+  const evidence = app.nodes.get('prompt-content').children.find((node) => node.className === 'evidence-section');
+  const record = evidence.children.find((node) => node.tagName === 'details');
+  assert.equal(record.children[0].tagName, 'summary');
+  assert.match(record.children[0].textContent, /Tool record 1 · search/);
+  assert.deepEqual(JSON.parse(record.children[1].textContent), { type: 'search', query: 'example' });
+  assert.match(app.content('hosted'), /Not exposed by response/);
+  assert.doesNotMatch(app.content('hosted'), /0 observed tool records/);
+});
+
+test('reset restores both neutral empty states and removes previous evidence and diagnostics', async () => {
+  const app = setup(() => response(result({ text: 'Previous answer', conversation_id: 'previous-id' })));
+  await app.submit();
+  app.reset();
+  for (const [agent, number] of [['prompt', '01'], ['hosted', '02']]) {
+    const empty = app.nodes.get(`${agent}-content`).children[0];
+    assert.equal(empty.className, 'empty-state');
+    assert.equal(empty.children[0].textContent, number);
+    assert.equal(empty.children[0].attributes['aria-hidden'], 'true');
+    assert.match(empty.textContent, /Ready for your question/);
+    assert.match(empty.textContent, /available search evidence/);
+    assert.doesNotMatch(empty.textContent, /Previous answer|previous-id|Conversation & telemetry/);
+    assert.equal(app.nodes.get(`${agent}-state`).textContent, 'Ready');
+  }
+  assert.equal(app.nodes.get('message').focused, true);
 });
 
 test('displays Not reported for missing, null, blank, and invalid IDs without inventing values or copy controls', async () => {
