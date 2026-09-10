@@ -333,7 +333,7 @@ test('prioritizes answers and visible evidence over collapsed diagnostics withou
     assert.equal(children[0].className, 'answer-section');
     assert.equal(children.at(-1).className, 'diagnostics');
     assert.equal(children.at(-1).tagName, 'details');
-    for (const name of ['metrics', 'evidence-section', 'citations-section']) {
+    for (const name of ['metrics', 'evidence-section']) {
       const section = children.find((node) => node.className === name);
       assert.ok(section, `${name} must remain outside collapsed diagnostics`);
       assert.notEqual(section.tagName, 'details');
@@ -595,30 +595,13 @@ test('renders and copies actual hosted model response ID as inert text even in f
   assert.deepEqual(copied, [modelId]);
 });
 
-test('renders untrusted answers as text and allows only absolute http/https citation links', async () => {
+test('renders untrusted answers as inert text, never executing embedded markup', async () => {
   const payload = '<script>alert("untrusted")</script>';
-  const app = setup(() => response(result({
-    text: payload,
-    citations: [
-      { title: payload, url: 'https://example.com/source' },
-      { title: 'Unsafe', url: 'javascript:alert(1)' },
-      { url: 'data:text/html,test' },
-      '/relative/path',
-      { url: 'https://name:secret@example.com/' },
-      { unexpected: payload },
-      'http://example.com/other'
-    ]
-  })));
+  const app = setup(() => response(result({ text: payload })));
   await app.submit();
   const nodes = descendants(app.nodes.get('prompt-content'));
   assert.match(app.content('prompt'), /<script>/);
   assert.equal(nodes.some((node) => node.tagName === 'script'), false);
-  const links = nodes.filter((node) => node.tagName === 'a');
-  assert.deepEqual(links.map((link) => link.href), ['https://example.com/source', 'http://example.com/other']);
-  for (const link of links) {
-    assert.equal(link.rel, 'noopener noreferrer');
-    assert.equal(link.referrerPolicy, 'no-referrer');
-  }
 });
 
 test('rejects empty and oversized questions and disallows duplicate in-flight requests', async () => {

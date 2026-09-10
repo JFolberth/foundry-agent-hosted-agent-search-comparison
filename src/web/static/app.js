@@ -211,48 +211,6 @@
     return section;
   }
 
-  function allowedUrl(value) {
-    if (typeof value !== 'string') return null;
-    try {
-      const url = new URL(value);
-      return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password
-        ? url.href : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function renderCitations(citations) {
-    const section = element('section', undefined, 'citations-section');
-    section.append(element('h4', 'Citations'));
-    if (!Array.isArray(citations) || citations.length === 0) {
-      section.append(element('p', 'No citations returned.', 'muted'));
-      return section;
-    }
-    const list = element('ol');
-    for (const citation of citations) {
-      const object = citation && typeof citation === 'object' ? citation : {};
-      const rawUrl = typeof citation === 'string' ? citation : object.url || object.uri || object.href;
-      const url = allowedUrl(rawUrl);
-      const label = safeText(object.title || object.label || object.name || rawUrl || citation);
-      const item = element('li');
-      if (url) {
-        const link = element('a', label || url);
-        link.href = url;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        link.referrerPolicy = 'no-referrer';
-        link.append(element('span', ' (opens in a new tab)', 'sr-only'));
-        item.append(link);
-      } else {
-        item.textContent = label || 'Citation details not provided';
-      }
-      list.append(item);
-    }
-    section.append(list);
-    return section;
-  }
-
   function renderResult(agent, result, question) {
     if (!result || typeof result !== 'object' || Array.isArray(result)) {
       showPanelError(agent, 'The server did not return a valid result for this agent.');
@@ -282,7 +240,7 @@
         'evidence-note'
       ));
     }
-    content.append(...renderMetrics(result), renderTools(result), renderCitations(result.citations));
+    content.append(...renderMetrics(result), renderTools(result));
     if (!hasError && hasText) {
       history[agent] = [
         ...history[agent],
@@ -393,7 +351,7 @@
       empty.append(
         mark,
         element('p', 'Ready for your question', 'empty-title'),
-        element('p', 'Compare the answer, timing, and tokens.\nInspect citations and available search evidence below.')
+        element('p', 'Compare the answer, timing, and tokens.\nInspect available search evidence below.')
       );
       document.getElementById(`${agent}-content`).replaceChildren(empty);
     }

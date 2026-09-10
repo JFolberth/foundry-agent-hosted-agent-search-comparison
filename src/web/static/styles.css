@@ -102,7 +102,7 @@ textarea[readonly] { opacity: .75; }
 .metric { background: var(--surface-soft); border: 1px solid var(--border); border-radius: .4rem; padding: .55rem .65rem; min-width: 0; }
 dt { color: var(--muted); font-size: .68rem; }
 dd { margin: .2rem 0 0; font-weight: 600; font-size: .95rem; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
-.evidence-section, .citations-section { border-top: 1px solid var(--border); padding-top: .9rem; margin-top: .9rem; }
+.evidence-section { border-top: 1px solid var(--border); padding-top: .9rem; margin-top: .9rem; }
 .evidence-status, .muted { color: var(--muted); font-size: .82rem; }
 .evidence-note { color: var(--muted); font-size: .82rem; margin-top: .5rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 details { margin-top: .65rem; border: 1px solid var(--border); border-radius: .55rem; }
@@ -120,8 +120,6 @@ details[open] > summary { border-bottom: 1px solid var(--border); }
 .copy-id { flex: 0 0 auto; font-size: .75rem; padding: .35rem .65rem; }
 .copy-status { margin-top: .65rem; font-size: .75rem; color: var(--muted); overflow-wrap: anywhere; }
 .copy-status:empty { margin-top: 0; }
-.citations-section ol { margin: 0; padding-left: 1.25rem; font-size: .82rem; }
-.citations-section li { padding: .3rem 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 a { color: var(--accent); text-underline-offset: .2em; }
 .error-notice { background: var(--error-bg); border: 1px solid var(--error); border-radius: .65rem; padding: 1rem; color: var(--error); margin-bottom: 1rem; overflow-wrap: anywhere; }
 .error-notice p { font-size: .85rem; white-space: pre-wrap; }
