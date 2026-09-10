@@ -159,7 +159,14 @@
       metric('Output tokens', tokenCount(result.usage?.output_tokens)),
       metric('Reasoning tokens', tokenCount(result.usage?.output_tokens_details?.reasoning_tokens))
     );
-    return metrics;
+    const note = element('p',
+      'Each turn\u2019s counts come straight from that call\u2019s own response and are not carried over from '
+      + 'earlier turns. Input tokens still are not directly comparable across agents: the prompt agent\u2019s '
+      + 'Foundry-managed conversation resends the full prior history \u2014 including earlier tool results \u2014 '
+      + 'on every turn, while the hosted agent replays only the plain text history and re-searches fresh each time.',
+      'evidence-note'
+    );
+    return [metrics, note];
   }
 
   function renderTools(result) {
@@ -264,7 +271,7 @@
         'evidence-note'
       ));
     }
-    content.append(renderMetrics(result), renderTools(result), renderCitations(result.citations));
+    content.append(...renderMetrics(result), renderTools(result), renderCitations(result.citations));
     if (!hasError && hasText) {
       history[agent] = [
         ...history[agent],
