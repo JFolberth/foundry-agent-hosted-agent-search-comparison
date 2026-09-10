@@ -38,7 +38,7 @@ class Node {
   focus() { this.focused = true; }
 }
 
-function setup(fetchHandler, navigator = {}) {
+function setup(fetchHandler, navigator = {}, configResponse = { ok: true, json: async () => ({ deployed_at: null }) }) {
   const nodes = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Node()]));
   const requests = [];
   vm.runInNewContext(source, {
@@ -50,10 +50,11 @@ function setup(fetchHandler, navigator = {}) {
       createElement: (tag) => new Node(tag)
     },
     fetch: async (url, options) => {
+      if (url === '/api/config') return configResponse;
       requests.push({ url, ...options, body: JSON.parse(options.body) });
       return fetchHandler(requests.length);
     },
-    URL, TypeError, SyntaxError, navigator
+    URL, TypeError, SyntaxError, navigator, crypto
   }, { filename: path.join(__dirname, 'app.js') });
   return {
     nodes, requests,
@@ -83,6 +84,19 @@ function response(prompt = result(), hosted = result(), extra = {}) {
 function descendants(node) {
   return node.children.flatMap((child) => [child, ...descendants(child)]);
 }
+
+test('renders the deploy timestamp reported by the backend, or a fallback when unavailable', async () => {
+  const withStamp = setup(() => response(), {}, {
+    ok: true, json: async () => ({ deployed_at: '2026-01-02T03:04:05Z' }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(withStamp.nodes.get('deployed-at').textContent, /^Deployed: /);
+  assert.doesNotMatch(withStamp.nodes.get('deployed-at').textContent, /unavailable/);
+
+  const withoutStamp = setup(() => response(), {}, { ok: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(withoutStamp.nodes.get('deployed-at').textContent, 'Deployed: unavailable');
+});
 
 test('loads only same-origin external script and stylesheet without inline CSP exceptions', () => {
   const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
@@ -150,8 +164,11 @@ test('uses one backend request, independently retains only successful history, a
   assert.deepEqual(app.requests[0].body, {
     message: 'First question',
     history: { prompt: [], hosted: [], prompt_none: [], hosted_none: [] },
-    continuation: { prompt: null, hosted: null, prompt_none: null, hosted_none: null }
+    continuation: { prompt: null, hosted: null, prompt_none: null, hosted_none: null },
+    session: app.requests[0].body.session
   });
+  assert.equal(typeof app.requests[0].body.session.hosted, 'string');
+  assert.equal(typeof app.requests[0].body.session.hosted_none, 'string');
   assert.match(app.content('hosted'), /Agent unavailable/);
   assert.match(app.content('hosted'), /Partial answer/);
   await app.submit('Follow-up');
@@ -664,8 +681,24 @@ test('has no reasoning control; each panel labels its fixed reasoning effort and
   assert.match(html, /04 \/ Hosted · No reasoning/);
   const app = setup(() => response());
   await app.submit();
-  assert.deepEqual(Object.keys(app.requests[0].body).sort(), ['continuation', 'history', 'message']);
+  assert.deepEqual(Object.keys(app.requests[0].body).sort(), ['continuation', 'history', 'message', 'session']);
   assert.deepEqual(Object.keys(app.requests[0].body.history).sort(), ['hosted', 'hosted_none', 'prompt', 'prompt_none']);
+  assert.deepEqual(Object.keys(app.requests[0].body.session).sort(), ['hosted', 'hosted_none']);
+});
+
+test('sends a stable per-chat hosted session id across turns, and a fresh one after reset', async () => {
+  const app = setup(() => response());
+  await app.submit();
+  const firstSession = app.requests[0].body.session;
+  assert.equal(typeof firstSession.hosted, 'string');
+  assert.equal(typeof firstSession.hosted_none, 'string');
+  assert.notEqual(firstSession.hosted, firstSession.hosted_none);
+  await app.submit();
+  assert.deepEqual(app.requests[1].body.session, firstSession);
+  app.reset();
+  await app.submit();
+  assert.notEqual(app.requests[2].body.session.hosted, firstSession.hosted);
+  assert.notEqual(app.requests[2].body.session.hosted_none, firstSession.hosted_none);
 });
 
 test('sends opaque continuations independently, advances successful sides only, and clears both on reset', async () => {

@@ -1,4 +1,5 @@
 from contextlib import AsyncExitStack, asynccontextmanager
+from os import environ
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -73,6 +74,7 @@ def create_app(service=None):
             "search_top_k": config.search_top_k,
             "max_output_tokens": config.max_output_tokens,
             "public_anonymous": True,
+            "deployed_at": environ.get("DEPLOYED_AT"),
             "limits": {
                 "message_chars": MAX_MESSAGE,
                 "history_messages_per_agent": MAX_HISTORY_MESSAGES,

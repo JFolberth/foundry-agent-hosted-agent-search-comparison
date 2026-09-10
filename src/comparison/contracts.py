@@ -42,10 +42,24 @@ class Continuation(StrictModel):
     hosted_none: str | None = Field(default=None, min_length=40, max_length=64, pattern=r"^[\w-]+$")
 
 
+class HostedSession(StrictModel):
+    """Client-generated, opaque per-chat identifiers for hosted agent sandboxes.
+
+    Sent back unchanged as `agent_session_id` so the platform routes follow-up
+    turns of the same browser chat to the same warm sandbox instead of paying a
+    cold start on every turn. This only affects sandbox routing; it carries no
+    conversation content and the platform does not persist any state from it
+    beyond the sandbox's own idle timeout.
+    """
+    hosted: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[\w-]+$")
+    hosted_none: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[\w-]+$")
+
+
 class CompareRequest(StrictModel):
     message: str = Field(min_length=1, max_length=MAX_MESSAGE)
     history: History = Field(default_factory=History)
     continuation: Continuation = Field(default_factory=Continuation)
+    session: HostedSession = Field(default_factory=HostedSession)
 
     @field_validator("message")
     @classmethod

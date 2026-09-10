@@ -25,6 +25,13 @@
   const formError = document.getElementById('form-error');
   let history = Object.fromEntries(agents.map((agent) => [agent, []]));
   let continuation = Object.fromEntries(agents.map((agent) => [agent, null]));
+  // Opaque per-chat identifiers for hosted agent sandboxes only (prompt agents
+  // use Foundry-managed conversations instead). Kept stable across turns of
+  // the same chat so the platform reuses the warm sandbox instead of paying a
+  // cold start every turn; regenerated on reset to start a fresh sandbox.
+  let session = Object.fromEntries(
+    agents.filter(isHosted).map((agent) => [agent, crypto.randomUUID()])
+  );
   let pending = false;
 
   function element(tag, text, className) {
@@ -291,7 +298,7 @@
       const response = await fetch('/api/compare', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ message: question, history, continuation })
+        body: JSON.stringify({ message: question, history, continuation, session })
       });
       if (!response.ok) {
         throw new Error(`The comparison request failed (HTTP ${response.status}). Please try again.`);
@@ -336,6 +343,7 @@
     if (pending) return;
     history = Object.fromEntries(agents.map((agent) => [agent, []]));
     continuation = Object.fromEntries(agents.map((agent) => [agent, null]));
+    session = Object.fromEntries(agents.filter(isHosted).map((agent) => [agent, crypto.randomUUID()]));
     messageInput.value = '';
     updateCount();
     formError.hidden = true;
@@ -357,4 +365,22 @@
     }
     messageInput.focus();
   });
+
+  // Best-effort deploy timestamp so it's obvious whether the running UI
+  // actually reflects the latest deployment, independent of browser caching.
+  fetch('/api/config')
+    .then((response) => (response.ok ? response.json() : null))
+    .then((data) => {
+      const stamp = document.getElementById('deployed-at');
+      if (!stamp) return;
+      const value = data && typeof data.deployed_at === 'string' ? data.deployed_at : null;
+      const parsed = value ? new Date(value) : null;
+      stamp.textContent = parsed && !Number.isNaN(parsed.getTime())
+        ? `Deployed: ${parsed.toLocaleString()}`
+        : 'Deployed: unavailable';
+    })
+    .catch(() => {
+      const stamp = document.getElementById('deployed-at');
+      if (stamp) stamp.textContent = 'Deployed: unavailable';
+    });
 })();

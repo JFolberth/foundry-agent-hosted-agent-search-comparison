@@ -251,6 +251,9 @@ resource "azapi_resource" "web" {
               PROMPT_AGENT_VERSION      = tostring(azapi_data_plane_resource.prompt.output.agent_version)
               HOSTED_NONE_AGENT_VERSION = tostring(azapi_data_plane_resource.hosted_none.output.agent_version)
               PROMPT_NONE_AGENT_VERSION = tostring(azapi_data_plane_resource.prompt_none.output.agent_version)
+              # Refreshed on every apply so the UI footer can confirm a redeploy
+              # actually reached this container, instead of guessing from cache.
+              DEPLOYED_AT = timestamp()
             }) : { name = key, value = value }],
             [{ name = "APPLICATIONINSIGHTS_CONNECTION_STRING", secretRef = "application-insights" }]
           )

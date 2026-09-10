@@ -27,10 +27,12 @@ def test_native_prompt_and_hosted_parity(settings):
     assert data["tools"] == options["tools"] == [native_search_tool(settings, config).as_dict()]
     assert options["reasoning"] == data["reasoning"] == {"effort": "low"}
     assert options["instructions"] == data["instructions"] == config.instructions
-    assert "book recommender" in config.instructions
-    assert "Search before every recommendation" in config.instructions
-    assert "only titles present in the current turn's retrieved records" in config.instructions
-    assert "do not recommend books from memory" in config.instructions
+    assert "book curator" in config.instructions
+    assert "you must call the Azure AI Search tool" in config.instructions
+    assert "search again as many times as needed within the same turn" in config.instructions
+    assert "Only recommend or describe titles that are supported by search results" in config.instructions
+    assert "do not fall back to recommending anything from memory" in config.instructions
+    assert "say you don't know or that the catalog doesn't say, rather than guessing" in config.instructions
     assert options["model"] == data["model"] == settings.model_deployment
     assert options["tools"] == [{
         "type": "azure_ai_search",

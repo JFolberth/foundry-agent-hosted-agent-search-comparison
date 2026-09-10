@@ -102,7 +102,13 @@ class ComparisonService:
                         conversation_id = provider_id(conversation.id)
                         if conversation_id is None:
                             raise ConversationUnavailable()
-                    invocation = {"conversation": conversation_id} if kind == "prompt" else {}
+                    if kind == "prompt":
+                        invocation = {"conversation": conversation_id}
+                    else:
+                        # Reuse the browser's per-chat sandbox across turns to avoid a
+                        # cold start on every single request; see HostedSession.
+                        hosted_session_id = getattr(request.session, side, None)
+                        invocation = {"extra_body": {"agent_session_id": hosted_session_id}} if hosted_session_id else {}
                     stage = f"{side}.responses.create"
                     response = await self.clients[side].responses.create(
                         input=(seed if kind == "hosted" else []) + [{"role": "user", "content": request.message}],

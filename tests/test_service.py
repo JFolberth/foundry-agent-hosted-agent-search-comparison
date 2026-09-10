@@ -108,6 +108,25 @@ async def test_api_result_keeps_outer_and_model_response_identifiers(raw_respons
     assert result["prompt"]["model_response_id"] is None
 
 
+async def test_hosted_session_id_is_forwarded_to_avoid_cold_starts(raw_response):
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    session_id = "browser-chat-session-abc123"
+    await ComparisonService(clients, load_config()).compare(
+        CompareRequest(message="Q", session={"hosted": session_id}), "comparison",
+    )
+    hosted_kwargs = clients["hosted"].responses.create.call_args.kwargs
+    assert hosted_kwargs["extra_body"] == {"agent_session_id": session_id}
+    # Prompt agents are Foundry-managed conversations; no sandbox to keep warm.
+    prompt_kwargs = clients["prompt"].responses.create.call_args.kwargs
+    assert "extra_body" not in prompt_kwargs
+
+
+async def test_hosted_without_session_id_omits_extra_body(raw_response):
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    await ComparisonService(clients, load_config()).compare(CompareRequest(message="Q"), "comparison")
+    assert "extra_body" not in clients["hosted"].responses.create.call_args.kwargs
+
+
 async def test_concurrent_reuse_cannot_mutate_shared_provider_conversations(raw_response):
     clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
     service = ComparisonService(clients, load_config())
