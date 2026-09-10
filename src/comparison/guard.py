@@ -82,6 +82,9 @@ class HostedRequestGuard:
             data = json.loads(part["body"])
             if not isinstance(data, dict) or data.get("background"):
                 raise ValueError()
+            if data.get("store") is True or data.get("conversation") or data.get("previous_response_id"):
+                raise ValueError()
+            data["store"] = False
             if isinstance(data.get("input"), list) and len(data["input"]) > 160:
                 raise ValueError()
             for key in (
@@ -91,7 +94,7 @@ class HostedRequestGuard:
                 data.pop(key, None)
         except (ValueError, KeyError):
             return await JSONResponse(
-                {"error": {"code": "invalid_request", "message": "Use foreground requests with bounded text input."}},
+                {"error": {"code": "invalid_request", "message": "Use stateless foreground requests with bounded inline history."}},
                 status_code=400,
             )(scope, receive, send)
         delivered = False

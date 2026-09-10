@@ -663,5 +663,227 @@ class AzureRequestTests(unittest.TestCase):
                                                               "https://example.invalid"))
 
 
+class ProjectSearchRbacTests(unittest.TestCase):
+    def context_fixture(self):
+        session, outputs, values, _ = fixture()
+        outputs["project_principal_id"] = SUBSCRIPTION
+        values["outputs"]["project_principal_id"] = {"value": SUBSCRIPTION}
+        resources = values["root_module"]["child_modules"][0]["resources"]
+        resources[0]["values"]["identity"] = [{"principal_id": SUBSCRIPTION}]
+        resources.append({
+            "address": "module.workloads[0].azapi_resource.web", "mode": "managed",
+            "values": {"body": {"properties": {"template": {"containers": [{
+                "name": "web", "image": "exampleacr.azurecr.io/search-web@sha256:" + "b" * 64,
+            }]}}}},
+        })
+        session.registry.return_value = ("exampleacr", "exampleacr.azurecr.io")
+        with (patch.object(deploy, "confirm_project", return_value={"identity": {"principalId": SUBSCRIPTION}}),
+              patch.object(deploy, "azure_request", return_value={"id": SEARCH})):
+            context = deploy.project_search_rbac_context(session)
+        return session, outputs, values, context
+
+    def plan_fixture(self):
+        session, outputs, values, context = self.context_fixture()
+        changes = []
+        for key, role in deploy.PROJECT_SEARCH_ROLES.items():
+            name = str(deploy.uuid.uuid5(deploy.uuid.NAMESPACE_URL, f"{SEARCH}/{SUBSCRIPTION}/{role}".lower()))
+            changes.append({
+                "address": f'module.access.azapi_resource.assignment["{key}"]',
+                "mode": "managed", "type": "azapi_resource",
+                "change": {"actions": ["create"], "before": None, "after": {
+                    "type": "Microsoft.Authorization/roleAssignments@2022-04-01",
+                    "parent_id": SEARCH, "name": name,
+                    "body": {"properties": {
+                        "principalId": SUBSCRIPTION, "principalType": "ServicePrincipal",
+                        "roleDefinitionId": (f"/subscriptions/{SUBSCRIPTION}"
+                                             f"/providers/Microsoft.Authorization/roleDefinitions/{role}"),
+                    }},
+                }, "after_unknown": {"id": True, "body": {"properties": {}}}},
+            })
+        variables = {**session.target, "deploy_workloads": True, **context["images"]}
+        plan = {
+            "variables": {key: {"value": value} for key, value in variables.items()},
+            "prior_state": {"values": values}, "planned_values": values,
+            "resource_changes": changes,
+            "output_changes": {"deploy_workloads": {"actions": ["no-op"]}},
+            "configuration": {"root_module": {"module_calls": {"access": {"module": {"resources": [{
+                "address": "azapi_resource.assignment",
+                "expressions": {key: {} for key in ("body", "name", "parent_id", "type")},
+            }]}}}}},
+        }
+        return session, outputs, values, context, plan
+
+    def validate(self, session, context, plan):
+        deploy.validate_plan(session, plan, "project-search-rbac", context["images"], rbac_context=context)
+
+    def test_exact_two_creates_preserve_existing_workloads(self):
+        session, _, _, context, plan = self.plan_fixture()
+        self.validate(session, context, plan)
+
+    def test_context_pins_applied_images_without_current_provenance(self):
+        session, _, _, context = self.context_fixture()
+        with (patch.object(deploy, "confirm_project", return_value={"identity": {"principalId": SUBSCRIPTION}}),
+              patch.object(deploy, "azure_request", return_value={"id": SEARCH}) as request,
+              patch.object(deploy, "image_inputs", side_effect=AssertionError("unapplied images are not a source"))):
+            self.assertEqual(deploy.project_search_rbac_context(session), context)
+        self.assertEqual(request.call_args.args[1], "https://management.azure.com" + SEARCH + "?api-version=2025-05-01")
+        self.assertEqual(request.call_args.args[2], "https://management.azure.com/")
+
+    def test_wrong_arm_principal_or_scope_refused(self):
+        for principal, scope in (("different", SEARCH), (SUBSCRIPTION, SEARCH + "-other")):
+            session, _, _, _ = self.context_fixture()
+            with (self.subTest(principal=principal, scope=scope),
+                  patch.object(deploy, "confirm_project", return_value={"identity": {"principalId": principal}}),
+                  patch.object(deploy, "azure_request", return_value={"id": scope}),
+                  self.assertRaises(deploy.DeploymentError)):
+                deploy.project_search_rbac_context(session)
+
+    def test_foundation_only_state_cannot_use_rbac_repair(self):
+        session, _, values, _ = self.context_fixture()
+        values["outputs"]["deploy_workloads"]["value"] = False
+        with patch.object(deploy, "azure_request") as request, self.assertRaises(deploy.DeploymentError):
+            deploy.project_search_rbac_context(session)
+        request.assert_not_called()
+
+    def test_other_resources_and_noncreate_actions_refused(self):
+        for action in (["update"], ["delete"], ["create", "delete"], ["delete", "create"]):
+            session, _, _, context, plan = self.plan_fixture()
+            plan["resource_changes"][0]["change"]["actions"] = action
+            with self.subTest(action=action), self.assertRaises(deploy.DeploymentError):
+                self.validate(session, context, plan)
+        session, _, _, context, plan = self.plan_fixture()
+        plan["resource_changes"].append({"mode": "managed", "type": "azapi_resource",
+                                        "address": "module.workloads[0].azapi_resource.web",
+                                        "change": {"actions": ["update"]}})
+        with self.assertRaises(deploy.DeploymentError):
+            self.validate(session, context, plan)
+
+    def test_exact_principal_roles_scope_and_properties_required(self):
+        for path, value in (
+            (("parent_id",), SEARCH + "-other"),
+            (("name",), "00000000-0000-0000-0000-000000000000"),
+            (("body", "properties", "principalId"), "other-principal"),
+            (("body", "properties", "roleDefinitionId"), "other-role"),
+            (("body", "properties", "principalType"), "User"),
+            (("body", "properties", "condition"), "unapproved"),
+        ):
+            session, _, _, context, plan = self.plan_fixture()
+            node = plan["resource_changes"][0]["change"]["after"]
+            for part in path[:-1]:
+                node = node[part]
+            node[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(deploy.DeploymentError):
+                self.validate(session, context, plan)
+
+    def test_missing_duplicate_or_extra_assignment_refused(self):
+        for alteration in ("missing", "duplicate", "extra"):
+            session, _, _, context, plan = self.plan_fixture()
+            if alteration == "missing":
+                plan["resource_changes"].pop()
+            else:
+                extra = copy.deepcopy(plan["resource_changes"][0])
+                if alteration == "extra":
+                    extra["address"] = 'module.access.azapi_resource.assignment["ui_search_data"]'
+                plan["resource_changes"].append(extra)
+            with self.subTest(alteration=alteration), self.assertRaises(deploy.DeploymentError):
+                self.validate(session, context, plan)
+
+    def test_unknown_hidden_import_or_moved_requests_refused(self):
+        for alteration in ("unknown", "hidden", "import", "move", "query"):
+            session, _, _, context, plan = self.plan_fixture()
+            resource = plan["resource_changes"][0]
+            if alteration == "unknown":
+                resource["change"]["after_unknown"]["body"] = {"properties": {"principalId": True}}
+            elif alteration == "hidden":
+                resource["change"]["after"]["sensitive_body_version"] = {"body": "secret"}
+            elif alteration == "import":
+                resource["change"]["importing"] = {"id": "unapproved"}
+            elif alteration == "move":
+                resource["previous_address"] = "module.other.assignment"
+            else:
+                resource["change"]["after"]["create_query_parameters"] = {"unapproved": ["true"]}
+            with self.subTest(alteration=alteration), self.assertRaises(deploy.DeploymentError):
+                self.validate(session, context, plan)
+
+    def test_write_only_config_and_provisioners_cannot_hide_from_plan_values(self):
+        for field in ("sensitive_body", "ignore_body_changes", "provisioners"):
+            session, _, _, context, plan = self.plan_fixture()
+            resource = plan["configuration"]["root_module"]["module_calls"]["access"]["module"]["resources"][0]
+            if field == "provisioners":
+                resource[field] = [{"type": "local-exec"}]
+            else:
+                resource["expressions"][field] = {"references": ["var.unapproved"]}
+            with self.subTest(field=field), self.assertRaisesRegex(deploy.DeploymentError, "reviewed assignment schema"):
+                self.validate(session, context, plan)
+
+    def test_state_stage_images_and_output_changes_are_bound(self):
+        for alteration in ("stage", "images", "principal", "output"):
+            session, _, _, context, plan = self.plan_fixture()
+            if alteration == "stage":
+                plan["variables"]["deploy_workloads"]["value"] = False
+            elif alteration == "images":
+                plan["variables"]["hosted_image"]["value"] = "new-unapplied-image"
+            elif alteration == "principal":
+                plan["prior_state"]["values"]["outputs"]["project_principal_id"]["value"] = "other"
+            else:
+                plan["output_changes"]["hosted_agent_version"] = {"actions": ["update"]}
+            with self.subTest(alteration=alteration), self.assertRaises(deploy.DeploymentError):
+                self.validate(session, context, plan)
+
+    def test_planning_uses_applied_image_overrides_and_never_applies(self):
+        session, outputs, _, context, plan = self.plan_fixture()
+        session.outputs.return_value = outputs
+        session.tfvars = Mock(read_bytes=lambda: b"private tfvars")
+        saved = {}
+        with (patch.object(deploy, "project_search_rbac_context", return_value=context),
+              patch.object(deploy, "image_inputs", side_effect=AssertionError("no build provenance")),
+              patch.object(deploy, "permission_readiness", side_effect=AssertionError("no data-plane grant needed")),
+              patch.object(deploy, "infra_inputs", return_value={}),
+              patch.object(deploy, "private_dir", side_effect=lambda path: path),
+              patch.object(deploy, "write_json", side_effect=lambda path, value: saved.update({path: value})),
+              patch.object(deploy, "write_private"),
+              patch.object(deploy, "regular", return_value=Mock()),
+              patch.object(Path, "read_bytes", return_value=b"binary"),
+              patch.object(deploy, "show_plan", return_value=(plan, b"Two approved role creates")),
+              patch.object(deploy, "confirm", side_effect=AssertionError("plan must never request apply")),
+              patch("sys.stdout", new_callable=io.StringIO)):
+            deploy.plan_stage(session, "project-search-rbac")
+        self.assertEqual(session.tf.call_args.args[0], "plan")
+        self.assertNotIn(f"-var-file={deploy.ARTIFACTS / 'images.tfvars.json'}", session.tf.call_args.args)
+        overrides = next(value for path, value in saved.items() if path.name == "stage.tfvars.json")
+        self.assertIs(overrides["deploy_workloads"], True)
+        self.assertEqual(overrides["hosted_image"], context["images"]["hosted_image"])
+        approval = next(value for path, value in saved.items() if path.name == "approval.json")
+        self.assertEqual(approval["rbac_context"], context)
+        self.assertEqual(approval["sha256"], deploy.digest(b"binary"))
+
+    def test_eventual_apply_still_requires_approval_and_fresh_arm_binding(self):
+        session, outputs, _, context, plan = self.plan_fixture()
+        session.outputs.return_value = outputs
+        session.args.stage = "project-search-rbac"
+        session.args.plan = "mock-path"
+        session.tfvars = Mock(read_bytes=lambda: b"private tfvars")
+        record = {
+            "stage": "project-search-rbac", "binding": session.binding(),
+            "images": context["images"], "rbac_context": context,
+            "infra_inputs": {}, "tfvars_sha256": deploy.digest(b"private tfvars"),
+            "sha256": deploy.digest(b"approved binary"),
+        }
+        changed = {**context, "principal_id": "changed-after-approval"}
+        with (patch.object(deploy, "project_search_rbac_context", side_effect=[context, changed]),
+              patch.object(deploy, "input_path", return_value=deploy.ARTIFACTS / "plans" / "unwritten" / "plan.bin"),
+              patch.object(deploy, "read_json", return_value=record),
+              patch.object(deploy, "regular", return_value=Mock(read_bytes=lambda: b"approved binary")),
+              patch.object(deploy, "infra_inputs", return_value={}),
+              patch.object(deploy, "image_inputs", side_effect=AssertionError("no unapplied image provenance")),
+              patch.object(deploy, "show_plan", return_value=(plan, b"two creates")),
+              patch.object(deploy, "confirm") as approval,
+              patch("sys.stdout", new_callable=io.StringIO),
+              self.assertRaisesRegex(deploy.DeploymentError, "scope/principal changed after approval")):
+            deploy.apply_stage(session)
+        approval.assert_called_once_with("APPROVE " + record["sha256"])
+        session.tf.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

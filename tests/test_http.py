@@ -1,15 +1,14 @@
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 from starlette.testclient import TestClient
-from azure.ai.agentserver.responses import InMemoryResponseProvider
-from azure.ai.agentserver.responses.store._foundry_errors import FoundryResourceNotFoundError
+from azure.ai.agentserver.responses import InMemoryResponseProvider, ResponseContext
 
 from comparison.config import load_config, model_options
-from comparison.contracts import MAX_RAW_BYTES, MAX_RAW_ITEMS, MAX_TURNS
+from comparison.contracts import MAX_HISTORY_CHARS, MAX_HISTORY_MESSAGES, MAX_RAW_BYTES, MAX_RAW_ITEMS, MAX_TURNS
 from comparison.guard import RequestGuard
 from comparison.service import ComparisonService
 from conftest import fake_client, fake_stream_client
@@ -19,6 +18,17 @@ from web.app import create_app
 
 def create_hosted_app(client, settings):
     return hosted_factory(client, settings, store=InMemoryResponseProvider())
+
+
+@pytest.fixture(autouse=True)
+def no_hosted_history(monkeypatch):
+    history = AsyncMock(side_effect=AssertionError("Stateless requests must not fetch history"))
+    history_ids = AsyncMock(side_effect=AssertionError("Stateless requests must not resolve stored history"))
+    monkeypatch.setattr(ResponseContext, "get_history", history)
+    monkeypatch.setattr(InMemoryResponseProvider, "get_history_item_ids", history_ids)
+    yield
+    history.assert_not_awaited()
+    history_ids.assert_not_awaited()
 
 
 def test_web_routes_contract_and_safe_validation(raw_response):
@@ -80,6 +90,8 @@ async def test_hosted_protocol_preserves_native_items(settings, raw_response):
             args = downstream.responses.create.call_args.kwargs
             assert args["model"] == settings.model_deployment
             assert args["reasoning"] == {"effort": "low"}
+            assert args["max_output_tokens"] == 4096
+            assert args["include"] == ["reasoning.encrypted_content"]
             assert args["store"] is False
             assert args["stream"] is True
             assert args["tools"][0]["type"] == "azure_ai_search"
@@ -109,18 +121,17 @@ async def test_hosted_failure_is_sanitized_without_continuation(settings, raw_re
             assert response.json()["store"] is False
 
 
-async def test_hosted_previous_response_replays_stored_native_history(settings, raw_response):
+async def test_hosted_followup_resends_only_explicit_transcript(settings, raw_response):
     downstream = fake_stream_client(raw_response)
     app = create_hosted_app(downstream, settings)
+    transcript = [
+        {"role": "user", "content": "Earlier"},
+        {"role": "assistant", "content": "Earlier answer"},
+        {"role": "user", "content": "Question"},
+    ]
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://host") as client:
-            first = await client.post("/responses", json={
-                "input": [
-                    {"role": "user", "content": "Earlier"},
-                    {"role": "assistant", "content": "Earlier answer"},
-                    {"role": "user", "content": "Question"},
-                ],
-            })
+            first = await client.post("/responses", json={"input": transcript})
             assert first.status_code == 200
             assert first.json()["status"] == "completed", first.text
             first_args = downstream.responses.create.call_args.kwargs
@@ -133,48 +144,54 @@ async def test_hosted_previous_response_replays_stored_native_history(settings, 
             assert first_args["store"] is False
             response_id = first.json()["id"]
             assert response_id != raw_response["id"]
-            assert first.json()["store"] is True
+            assert first.json()["store"] is False
             stored = await client.get(f"/responses/{response_id}")
-            assert stored.status_code == 200
-            assert stored.json() == first.json()
-            response = await client.post("/responses", json={
-                "input": "Follow up", "previous_response_id": response_id,
-            })
+            assert stored.status_code == 404
+            transcript.extend([
+                {"role": "assistant", "content": "Indexed answer."},
+                {"role": "user", "content": "Follow up"},
+            ])
+            response = await client.post("/responses", json={"input": transcript, "store": False})
             assert response.status_code == 200
             assert response.json()["status"] == "completed", response.text
             args = downstream.responses.create.call_args.kwargs
             assert "conversation" not in args
             assert args["store"] is False
             assert args["stream"] is True
-            stored_input = args["input"][:3]
-            assert [
-                {key: value for key, value in item.items() if key not in ("id", "status")}
-                for item in stored_input
-            ] == first_args["input"]
-            assert all(item["id"].startswith("msg_") and item["status"] == "completed" for item in stored_input)
-            assert args["input"][3:-1] == raw_response["output"]
-            assert args["input"][-1]["role"] == "user"
-            assert args["input"][-1]["content"] == [{"type": "input_text", "text": "Follow up"}]
+            assert args["input"] == [
+                {"type": "message", "role": item["role"], "content": [{"type": "input_text", "text": item["content"]}]}
+                for item in transcript
+            ]
+            assert "private-ciphertext" not in json.dumps(args["input"])
+            assert "search_1" not in json.dumps(args["input"])
             assert all("response_id" not in item and "agent_reference" not in item for item in args["input"])
             assert "previous_response_id" not in args
             assert "x-client-hosted-continuation" not in args["extra_headers"]
             downstream.conversations.create.assert_not_awaited()
             assert downstream.responses.create.await_count == 2
-            assert response.json()["previous_response_id"] == response_id
+            assert not response.json().get("previous_response_id")
+            assert not response.json().get("conversation")
             assert response.json()["id"] not in (response_id, raw_response["id"])
             assert response.json()["metadata"]["native_response_id"] == raw_response["id"]
             assert "hosted_model_continuation" not in response.json()["metadata"]
-            assert (await client.get(f"/responses/{response.json()['id']}")).json() == response.json()
+            assert (await client.get(f"/responses/{response.json()['id']}")).status_code == 404
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_hosted_guard_rejects_background_before_sdk(settings, raw_response, stream):
+@pytest.mark.parametrize("options", [
+    {"background": True},
+    {"store": True},
+    {"conversation": "conv_private"},
+    {"conversation": {"id": "conv_private"}},
+    {"previous_response_id": "resp_private"},
+])
+async def test_hosted_guard_rejects_persistence_and_background_before_sdk(settings, raw_response, stream, options):
     downstream = fake_stream_client(raw_response)
     app = create_hosted_app(downstream, settings)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://host") as client:
             response = await client.post("/responses", json={
-                "input": "private request content", "background": True, "stream": stream,
+                "input": "private request content", "stream": stream, **options,
             })
             assert response.status_code == 400
             assert response.headers["content-type"].startswith("application/json")
@@ -230,25 +247,32 @@ async def test_hosted_guard_strips_overrides_before_sdk_validation(settings, raw
 
 @pytest.mark.parametrize("options", [
     {},
-    {"store": True},
+    {"store": False},
     {"store": False, "background": False, "conversation": None, "previous_response_id": None},
 ])
-async def test_hosted_defaults_to_stored_outer_response_only(settings, raw_response, options):
+@pytest.mark.parametrize("explicit_provider", [False, True])
+async def test_hosted_defaults_to_unstored_with_in_memory_provider(
+    settings, raw_response, options, explicit_provider, monkeypatch,
+):
     downstream = fake_stream_client(raw_response)
-    app = create_hosted_app(downstream, settings)
+    provider = InMemoryResponseProvider()
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr("hosted_agent.app.InMemoryResponseProvider", factory)
+    app = hosted_factory(downstream, settings, **({"store": provider} if explicit_provider else {}))
+    if explicit_provider:
+        factory.assert_not_called()
+    else:
+        factory.assert_called_once_with()
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://host") as client:
             response = await client.post("/responses", json={"input": "Question", **options})
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "completed"
-            assert data["store"] is options.get("store", True)
+            assert data["store"] is False
             stored = await client.get(f"/responses/{data['id']}")
-            if data["store"]:
-                assert stored.status_code == 200
-                assert stored.json() == data
-            else:
-                assert stored.status_code == 404
+            assert stored.status_code == 404
+            assert "private-ciphertext" not in stored.text
             args = downstream.responses.create.call_args.kwargs
             assert args["store"] is False
             assert "conversation" not in args
@@ -273,8 +297,7 @@ async def test_hosted_http_security_guard_blocks_before_model(settings, raw_resp
             downstream.responses.create.assert_not_awaited()
 
 
-@pytest.mark.parametrize("store", [False, True])
-async def test_hosted_stored_response_can_branch_without_consuming_history(settings, raw_response, store):
+async def test_hosted_transcript_can_branch_without_server_history(settings, raw_response):
     downstream = fake_stream_client(raw_response)
     app = create_hosted_app(downstream, settings)
     async with app.router.lifespan_context(app):
@@ -292,27 +315,29 @@ async def test_hosted_stored_response_can_branch_without_consuming_history(setti
             branch_ids = set()
             for message in ("Follow up", "Different follow up"):
                 continued = await client.post("/responses", json={
-                    "input": message, "previous_response_id": response_id, "store": store,
+                    "input": [
+                        {"role": "user", "content": "Question"},
+                        {"role": "assistant", "content": "Indexed answer."},
+                        {"role": "user", "content": message},
+                    ], "store": False,
                 }, headers={
                     "x-agent-user-id": "alice", "x-agent-foundry-call-id": "opaque-call-two",
                     "x-client-hosted-continuation": "obsolete-private-token",
                 })
                 assert continued.status_code == 200
                 assert continued.json()["status"] == "completed", continued.text
-                assert continued.json()["previous_response_id"] == response_id
-                assert continued.json()["store"] is store
+                assert not continued.json().get("previous_response_id")
+                assert not continued.json().get("conversation")
+                assert continued.json()["store"] is False
                 branch_ids.add(continued.json()["id"])
                 stored = await client.get(f"/responses/{continued.json()['id']}")
-                if store:
-                    assert stored.status_code == 200
-                    assert stored.json() == continued.json()
-                else:
-                    assert stored.status_code == 404
+                assert stored.status_code == 404
                 args = downstream.responses.create.call_args.kwargs
-                assert {
-                    key: value for key, value in args["input"][0].items() if key not in ("id", "status")
-                } == initial_input[0]
-                assert args["input"][1:-1] == raw_response["output"]
+                assert len(args["input"]) == 3
+                assert args["input"][0] == initial_input[0]
+                assert args["input"][1] == {
+                    "type": "message", "role": "assistant", "content": [{"type": "input_text", "text": "Indexed answer."}],
+                }
                 assert args["input"][-1]["content"] == [{"type": "input_text", "text": message}]
                 assert args["store"] is False
                 assert "conversation" not in args
@@ -324,13 +349,18 @@ async def test_hosted_stored_response_can_branch_without_consuming_history(setti
                 assert "hosted_model_continuation" not in continued.json()["metadata"]
             assert len(branch_ids) == 2
             assert response_id not in branch_ids
-            assert (await client.get(f"/responses/{response_id}")).json() == first.json()
+            assert (await client.get(f"/responses/{response_id}")).status_code == 404
             downstream.conversations.create.assert_not_awaited()
             assert downstream.responses.create.await_count == 3
+            fresh = await client.post("/responses", json={"input": "Fresh question"})
+            assert fresh.json()["status"] == "completed"
+            assert downstream.responses.create.call_args.kwargs["input"] == [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Fresh question"}]},
+            ]
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_hosted_provider_missing_previous_response_is_sdk_not_found(settings, raw_response, monkeypatch, stream):
+async def test_hosted_rejects_previous_response_even_for_actual_response_id(settings, raw_response, stream):
     downstream = fake_stream_client(raw_response)
     app = create_hosted_app(downstream, settings)
     async with app.router.lifespan_context(app):
@@ -339,52 +369,81 @@ async def test_hosted_provider_missing_previous_response_is_sdk_not_found(settin
             assert first.json()["status"] == "completed"
             response_id = first.json()["id"]
             assert (await client.get(f"/responses/{response_id}")).status_code == 404
-            # The local provider returns empty history for missing IDs; simulate
-            # the platform provider's explicit not-found response at its boundary.
-            history = AsyncMock(side_effect=FoundryResourceNotFoundError("Response not found"))
-            monkeypatch.setattr(InMemoryResponseProvider, "get_history_item_ids", history)
             response = await client.post("/responses", json={
                 "input": "private follow up", "previous_response_id": response_id, "stream": stream,
             })
-            assert response.status_code == 404
+            assert response.status_code == 400
             assert response.headers["content-type"].startswith("application/json")
+            assert response.json()["error"]["code"] == "invalid_request"
             assert "private follow up" not in response.text
             assert "private-ciphertext" not in response.text
-            history.assert_awaited_once()
-            assert history.call_args.args == (response_id, None, MAX_RAW_ITEMS + 1)
             downstream.conversations.create.assert_not_awaited()
             downstream.responses.create.assert_awaited_once()
 
 
-@pytest.mark.parametrize("conversation", ["conv_outer", {"id": "conv_outer"}])
-async def test_hosted_conversation_stays_outer_and_replays_provider_history(settings, raw_response, conversation):
-    downstream = fake_stream_client(raw_response)
-    app = create_hosted_app(downstream, settings)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://host") as client:
-            first = await client.post("/responses", json={"input": "Question", "conversation": conversation})
-            assert first.status_code == 200
-            assert first.json()["status"] == "completed", first.text
-            assert first.json()["conversation"]["id"] == "conv_outer"
-            initial_input = downstream.responses.create.call_args.kwargs["input"]
-            response = await client.post("/responses", json={
-                "input": "Follow up", "conversation": conversation,
-            })
-            assert response.status_code == 200
-            assert response.json()["status"] == "completed", response.text
-            assert response.json()["conversation"]["id"] == "conv_outer"
-            assert "hosted_model_continuation" not in response.json().get("metadata", {})
-            args = downstream.responses.create.call_args.kwargs
-            assert {
-                key: value for key, value in args["input"][0].items() if key not in ("id", "status")
-            } == initial_input[0]
-            assert args["input"][1:-1] == raw_response["output"]
-            assert args["input"][-1]["content"] == [{"type": "input_text", "text": "Follow up"}]
-            assert "conversation" not in args
-            assert "previous_response_id" not in args
-            assert args["store"] is False
-            downstream.conversations.create.assert_not_awaited()
-            assert downstream.responses.create.await_count == 2
+@pytest.mark.parametrize("conversation", [None, "conv_provider", {"id": "conv_provider"}])
+def test_web_hosted_resends_browser_transcript_and_reports_only_provider_ids(raw_response, conversation):
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    hosted_raw = {**raw_response, "id": "resp_hosted_actual", "conversation": conversation}
+    clients["hosted"] = fake_client(hosted_raw)
+    clients["hosted"].conversations.create.side_effect = AssertionError("Hosted conversations are not created")
+    with TestClient(create_app(ComparisonService(clients, load_config()))) as client:
+        first = client.post("/api/compare", json={"message": "Question"})
+        assert first.status_code == 200
+        data = first.json()
+        transcript = [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": data["hosted"]["text"]},
+        ]
+        second = client.post("/api/compare", json={
+            "message": "Follow up", "history": {"hosted": transcript},
+            "continuation": {"prompt": data["prompt"]["continuation"], "hosted": None},
+        })
+        assert second.status_code == 200
+        for result in (data["hosted"], second.json()["hosted"]):
+            assert result["error"] is None
+            assert result["continuation"] is None
+            assert result["response_id"] == hosted_raw["id"]
+            assert result["conversation_id"] == ("conv_provider" if conversation else None)
+            if conversation:
+                assert "Provider-reported" in result["conversation_note"]
+            else:
+                assert "no conversation ID was reported" in result["conversation_note"]
+                assert "not stored" in result["conversation_note"]
+        calls = clients["hosted"].responses.create.call_args_list
+        assert len(calls) == 2
+        assert calls[0].kwargs["input"] == [{"role": "user", "content": "Question"}]
+        assert calls[1].kwargs["input"] == [*transcript, {"role": "user", "content": "Follow up"}]
+        for call in calls:
+            assert call.kwargs["store"] is False
+            assert call.kwargs["stream"] is False
+            assert call.kwargs["max_output_tokens"] == 4096
+            assert call.kwargs["include"] == ["reasoning.encrypted_content"]
+            assert "reasoning" not in call.kwargs
+            assert "previous_response_id" not in call.kwargs
+            assert "conversation" not in call.kwargs
+        clients["hosted"].conversations.create.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bound", ["messages", "characters", "turns"])
+def test_web_rejects_oversized_hosted_transcript_before_hosted_call(raw_response, bound):
+    if bound == "messages":
+        history = [{"role": "assistant", "content": "Earlier"}] * (MAX_HISTORY_MESSAGES + 1)
+    elif bound == "characters":
+        history = [{"role": "assistant", "content": "x" * (MAX_HISTORY_CHARS // 3 + 1)}] * 3
+    else:
+        history = [{"role": "user", "content": "Earlier"}] * MAX_TURNS
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    with TestClient(create_app(ComparisonService(clients, load_config()))) as client:
+        response = client.post("/api/compare", json={"message": "Question", "history": {"hosted": history}})
+    if bound == "turns":
+        assert response.status_code == 200
+        assert response.json()["hosted"]["error"]
+        assert response.json()["hosted"]["continuation"] is None
+    else:
+        assert response.status_code == 422
+    clients["hosted"].responses.create.assert_not_awaited()
+    clients["hosted"].conversations.create.assert_not_awaited()
 
 
 @pytest.mark.parametrize("items", [
@@ -449,7 +508,7 @@ async def test_hosted_refusal_seed_output_and_oversized_history(settings, raw_re
             downstream.responses.create.assert_awaited_once()
 
 
-async def test_hosted_turn_limit_applies_to_inline_and_stored_history(settings, raw_response):
+async def test_hosted_turn_limit_applies_to_each_inline_transcript(settings, raw_response):
     downstream = fake_stream_client(raw_response)
     app = create_hosted_app(downstream, settings)
     async with app.router.lifespan_context(app):
@@ -468,7 +527,11 @@ async def test_hosted_turn_limit_applies_to_inline_and_stored_history(settings, 
             assert at_limit.json()["status"] == "completed", at_limit.text
             assert len(downstream.responses.create.call_args.kwargs["input"]) == MAX_TURNS
             overflow = await client.post("/responses", json={
-                "input": "One too many", "previous_response_id": at_limit.json()["id"],
+                "input": [
+                    *[{"role": "user", "content": "Question"}] * MAX_TURNS,
+                    {"role": "assistant", "content": "Indexed answer."},
+                    {"role": "user", "content": "One too many"},
+                ],
             })
             assert overflow.status_code == 200
             assert overflow.json()["status"] == "incomplete"
@@ -479,15 +542,14 @@ async def test_hosted_turn_limit_applies_to_inline_and_stored_history(settings, 
 
 
 @pytest.mark.parametrize("bound", ["items", "bytes"])
-async def test_hosted_bounds_include_stored_native_history(settings, raw_response, bound):
+async def test_hosted_bounds_apply_to_resent_transcript(settings, raw_response, bound):
     if bound == "items":
         items = [
             {"role": "assistant", "content": f"Earlier answer {index}"}
-            for index in range(MAX_RAW_ITEMS - len(raw_response["output"]) - 1)
+            for index in range(MAX_RAW_ITEMS - 1)
         ]
         items.append({"role": "user", "content": "Question"})
     else:
-        raw_response["output"][0]["encrypted_content"] = "x" * (MAX_RAW_BYTES // 2)
         items = [{"role": "user", "content": "q" * (MAX_RAW_BYTES // 2)}]
     downstream = fake_stream_client(raw_response)
     app = create_hosted_app(downstream, settings)
@@ -497,24 +559,31 @@ async def test_hosted_bounds_include_stored_native_history(settings, raw_respons
             assert first.status_code == 200
             assert first.json()["status"] == "completed", first.text
             overflow = await client.post("/responses", json={
-                "input": "Follow up", "previous_response_id": first.json()["id"],
+                "input": [
+                    *items,
+                    {"role": "assistant", "content": "x" * (MAX_RAW_BYTES // 2) if bound == "bytes" else "Answer"},
+                    {"role": "user", "content": "Follow up"},
+                ],
             })
-            assert overflow.status_code == 200
-            assert overflow.json()["status"] == "incomplete", overflow.text
-            assert overflow.json()["error"]["code"] == "upstream_interrupted"
-            assert overflow.json()["output"] == []
-            assert "hosted_model_continuation" not in overflow.json().get("metadata", {})
+            assert overflow.status_code == (400 if bound == "items" else 413)
+            assert (await client.get(f"/responses/{first.json()['id']}")).status_code == 404
             downstream.conversations.create.assert_not_awaited()
             downstream.responses.create.assert_awaited_once()
 
 
-@pytest.mark.parametrize("store", [False, True])
-async def test_sse_preserves_raw_native_item(settings, raw_response, store):
+@pytest.mark.parametrize("options", [{}, {"store": False}])
+@pytest.mark.parametrize("history", [
+    [],
+    [{"role": "user", "content": "Earlier question"}, {"role": "assistant", "content": "Earlier answer"}],
+])
+async def test_sse_preserves_current_turn_native_items_without_storage(settings, raw_response, options, history):
     downstream = fake_stream_client(raw_response)
     app = create_hosted_app(downstream, settings)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://host") as client:
-            response = await client.post("/responses", json={"input": "Question", "stream": True, "store": store})
+            response = await client.post("/responses", json={
+                "input": [*history, {"role": "user", "content": "Question"}], "stream": True, **options,
+            })
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("text/event-stream")
             assert "event: response.output_item.done" in response.text
@@ -525,7 +594,7 @@ async def test_sse_preserves_raw_native_item(settings, raw_response, store):
                 for line in response.text.splitlines() if line.startswith("data: {")
             ]
             terminal = next(event["response"] for event in events if event["type"] == "response.completed")
-            assert terminal["store"] is store
+            assert terminal["store"] is False
             assert terminal["id"] != raw_response["id"]
             assert not {
                 "conversation_scope", "hosted_model_conversation_id", "hosted_model_continuation",
@@ -535,7 +604,7 @@ async def test_sse_preserves_raw_native_item(settings, raw_response, store):
                 if event["type"] in ("response.created", "response.in_progress", "response.completed")
             ]
             assert len(lifecycle) == 3
-            assert all(envelope["id"] == terminal["id"] and envelope["store"] is store for envelope in lifecycle)
+            assert all(envelope["id"] == terminal["id"] and envelope["store"] is False for envelope in lifecycle)
             done_items = [event["item"] for event in events if event["type"] == "response.output_item.done"]
             assert [
                 {key: value for key, value in item.items() if key != "response_id"}
@@ -550,21 +619,16 @@ async def test_sse_preserves_raw_native_item(settings, raw_response, store):
                 for item in terminal["output"]
             ] == raw_response["output"]
             stored = await client.get(f"/responses/{terminal['id']}")
-            if store:
-                assert stored.status_code == 200
-                assert stored.json() == {**terminal, "background": False}
-                continued = await client.post("/responses", json={
-                    "input": "Follow up", "previous_response_id": terminal["id"],
-                })
-                assert continued.status_code == 200
-                assert continued.json()["status"] == "completed", continued.text
-                assert downstream.responses.create.call_args.kwargs["input"][1:-1] == raw_response["output"]
-            else:
-                assert stored.status_code == 404
+            assert stored.status_code == 404
+            assert not terminal.get("previous_response_id")
+            assert not terminal.get("conversation")
             args = downstream.responses.create.call_args.kwargs
             assert args["store"] is False
             assert "conversation" not in args
             assert "previous_response_id" not in args
+            assert [(item["role"], item["content"][0]["text"]) for item in args["input"]] == [
+                *((item["role"], item["content"]) for item in history), ("user", "Question"),
+            ]
             downstream.conversations.create.assert_not_awaited()
 
 

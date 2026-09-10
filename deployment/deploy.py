@@ -785,6 +785,15 @@ def project_search_rbac_context(session):
 
 def project_search_rbac_guard(session, plan, context):
     require(isinstance(context, dict), "Missing authenticated project Search RBAC approval context.")
+    module = plan.get("configuration", {}).get("root_module", {}).get("module_calls", {}).get(
+        "access", {}).get("module", {})
+    assignment = [resource for resource in module.get("resources", [])
+                  if resource.get("address") == "azapi_resource.assignment"]
+    # Write-only values can be absent from planned `after`; inspect configuration too.
+    require(len(assignment) == 1 and not assignment[0].get("provisioners")
+            and set(assignment[0].get("expressions", {})) == {"body", "name", "parent_id", "type"},
+            "RBAC repair requires the reviewed assignment schema without write-only fields, "
+            "request overrides or provisioners.")
     prior = plan.get("prior_state", {}).get("values", {}).get("outputs", {})
     for output, expected in (
         ("deploy_workloads", True), ("project_id", context["project_id"]),
@@ -794,6 +803,14 @@ def project_search_rbac_guard(session, plan, context):
                 "Saved RBAC plan prior state differs from the authenticated applied target.")
     allowed = {f'module.access.azapi_resource.assignment["{key}"]': role
                for key, role in PROJECT_SEARCH_ROLES.items()}
+
+    def unknown_value(value):
+        if isinstance(value, dict):
+            return any(unknown_value(item) for item in value.values())
+        if isinstance(value, list):
+            return any(unknown_value(item) for item in value)
+        return value is True
+
     seen = set()
     for resource in plan.get("resource_changes", []):
         change = resource.get("change", {})
@@ -825,7 +842,8 @@ def project_search_rbac_guard(session, plan, context):
                 and after.get("body") == {"properties": properties},
                 "RBAC assignment does not exactly match approved project principal, role, Search scope and name.")
         unknown = change.get("after_unknown", {})
-        require(not any(unknown.get(key) for key in ("type", "parent_id", "name", "body", "sensitive_body"))
+        require(not any(unknown_value(unknown.get(key))
+                        for key in ("type", "parent_id", "name", "body", "sensitive_body"))
                 and not after.get("sensitive_body") and not after.get("sensitive_body_version")
                 and not after.get("create_headers") and not after.get("create_query_parameters"),
                 "Unknown/hidden RBAC request fields or create overrides cannot be approved.")

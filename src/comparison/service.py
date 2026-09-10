@@ -64,18 +64,17 @@ class ComparisonService:
         ) as span:
             try:
                 token = getattr(request.continuation, side)
-                hosted_response_id = None
                 seed = []
-                if token:
+                if side == "hosted":
+                    seed = [m.model_dump() for m in request.history.hosted]
+                    turns = sum(item["role"] == "user" for item in seed)
+                elif token:
                     stage = "continuation"
                     # A Foundry conversation is mutable. Consuming the capability
                     # before awaiting prevents concurrent reuse and stale replay.
                     snapshot = self.store.take(token, side)
                     conversation_id, turns = snapshot.conversation_id, snapshot.turns
-                    hosted_response_id = snapshot.response_id
-                    if side == "prompt" and not conversation_id:
-                        raise HistoryExpired()
-                    if side == "hosted" and not hosted_response_id:
+                    if not conversation_id:
                         raise HistoryExpired()
                 else:
                     seed = [m.model_dump() for m in getattr(request.history, side)]
@@ -101,21 +100,20 @@ class ComparisonService:
                         if conversation_id is None:
                             raise ConversationUnavailable()
                     invocation = {"conversation": conversation_id} if side == "prompt" else {}
-                    if side == "hosted" and hosted_response_id:
-                        invocation["previous_response_id"] = hosted_response_id
                     stage = f"{side}.responses.create"
                     response = await self.clients[side].responses.create(
                         input=(seed if side == "hosted" else []) + [{"role": "user", "content": request.message}],
                         max_output_tokens=self.config.max_output_tokens,
                         include=["reasoning.encrypted_content"],
-                        store=True, stream=False, extra_headers=dict(headers), **invocation,
+                        store=side == "prompt", stream=False, extra_headers=dict(headers), **invocation,
                     )
                 stage = f"{side}.response.parse"
                 raw = response.model_dump(mode="json", exclude_unset=True, warnings=False)
                 reported = raw.get("conversation")
                 reported = reported.get("id") if isinstance(reported, dict) else reported
-                if side == "hosted" and conversation_id is None:
-                    conversation_id = provider_id(reported)
+                if side == "hosted":
+                    reported = provider_id(reported)
+                    conversation_id = reported
                 if reported is not None and reported != conversation_id:
                     result = error_result("Agent returned a different conversation. Reset before continuing.")
                 else:
@@ -136,9 +134,9 @@ class ComparisonService:
                         result["error"] = "Agent did not return a usable provider conversation continuation. Reset to continue."
                         result["continuation"] = None
                     else:
-                        result["continuation"] = self.store.put(
-                            side, [], turns + 1, conversation_id=conversation_id,
-                            response_id=result["response_id"] if side == "hosted" else None,
+                        result["continuation"] = (
+                            self.store.put(side, [], turns + 1, conversation_id=conversation_id)
+                            if side == "prompt" else None
                         )
                 record_evidence(span, result, comparison_id)
             except ConversationUnavailable as exc:
@@ -166,10 +164,10 @@ class ComparisonService:
             if conversation_id:
                 span.set_attribute("gen_ai.conversation.id", conversation_id)
             result["conversation_note"] = (
-                ("Actual hosted-endpoint conversation reported by the provider; history is platform-managed."
+                ("Provider-reported hosted conversation ID; history is supplied explicitly with each request."
                  if side == "hosted" else "Actual agent-bound Foundry conversation; provider-managed history.")
                 if conversation_id else (
-                    "Hosted history uses stored response IDs. No conversation ID was reported; no model conversation was created."
+                    "Hosted user/assistant history is resent with each request. Responses are not stored; no conversation ID was reported."
                     if side == "hosted" else "No provider conversation ID is available; none was fabricated."
                 )
             )

@@ -55,31 +55,44 @@ async def test_private_continuations_use_actual_provider_conversations(raw_respo
     first = await service.compare(CompareRequest(message="First"), "comparison-1")
     assert "private-ciphertext" not in json.dumps(first)
     tokens = {side: first[side]["continuation"] for side in clients}
+    assert tokens["hosted"] is None
     assert first["prompt"]["conversation_id"] != first["hosted"]["conversation_id"]
     second = await service.compare(
-        CompareRequest(message="Second", continuation=tokens), "comparison-2",
+        CompareRequest(
+            message="Second", continuation=tokens,
+            history={"hosted": [
+                {"role": "user", "content": "First"},
+                {"role": "assistant", "content": first["hosted"]["text"]},
+            ]},
+        ), "comparison-2",
     )
     assert second["prompt"]["error"] is None
     for side, client in clients.items():
         items = client.responses.create.call_args.kwargs["input"]
-        assert len(items) == 1
         args = client.responses.create.call_args.kwargs
         if side == "prompt":
+            assert len(items) == 1
             assert "previous_response_id" not in args
             assert args["conversation"] == first[side]["conversation_id"]
             assert args["store"] is True
             client.conversations.create.assert_awaited_once()
         else:
             assert "conversation" not in args
-            assert args["store"] is True
-            assert args["previous_response_id"] == first[side]["response_id"]
+            assert args["store"] is False
+            assert "previous_response_id" not in args
+            assert items == [
+                {"role": "user", "content": "First"},
+                {"role": "assistant", "content": first["hosted"]["text"]},
+                {"role": "user", "content": "Second"},
+            ]
             assert "x-client-hosted-continuation" not in args["extra_headers"]
             client.conversations.create.assert_not_awaited()
             assert first[side]["conversation_scope"] == "hosted_agent"
             assert first[side]["conversation_id"] is None
         assert items[-1] == {"role": "user", "content": "Second"}
+    foreign_token = service.store.put("hosted", [], 1, response_id="resp_legacy")
     swapped = await service.compare(
-        CompareRequest(message="Wrong", continuation={"prompt": second["hosted"]["continuation"]}), "comparison-3",
+        CompareRequest(message="Wrong", continuation={"prompt": foreign_token}), "comparison-3",
     )
     assert "another side" in swapped["prompt"]["error"]
     assert swapped["hosted"]["error"] is None
@@ -104,11 +117,13 @@ async def test_concurrent_reuse_cannot_mutate_shared_provider_conversations(raw_
         service.compare(CompareRequest(message=text, continuation=tokens), text)
         for text in ("Branch A", "Branch B")
     ])
-    for side in clients:
-        assert sum(branch[side]["error"] is None for branch in branches) == 1
-        assert clients[side].responses.create.await_count == 2
-        with pytest.raises(HistoryExpired):
-            service.store.get(tokens[side], side)
+    assert sum(branch["prompt"]["error"] is None for branch in branches) == 1
+    assert clients["prompt"].responses.create.await_count == 2
+    with pytest.raises(HistoryExpired):
+        service.store.get(tokens["prompt"], "prompt")
+    assert all(branch["hosted"]["error"] is None for branch in branches)
+    assert clients["hosted"].responses.create.await_count == 3
+    assert all(branch["hosted"]["continuation"] is None for branch in branches)
 
 
 async def test_timeout_is_independent(raw_response):

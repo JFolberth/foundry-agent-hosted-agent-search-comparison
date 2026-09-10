@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 from azure.ai.agentserver.core import get_request_context
 from azure.ai.agentserver.responses import (
-    CreateResponse, ResponseContext, ResponsesAgentServerHost, ResponsesServerOptions,
+    CreateResponse, InMemoryResponseProvider, ResponseContext, ResponsesAgentServerHost, ResponsesServerOptions,
 )
 from opentelemetry.propagate import extract
 from starlette.responses import JSONResponse
@@ -19,7 +19,7 @@ from comparison.contracts import MAX_RAW_BYTES, MAX_RAW_ITEMS, MAX_TURNS, MODEL_
 from comparison.diagnostics import failure, from_metadata, http_status, record_failure, response_request_id, to_metadata
 from comparison.evidence import extract_evidence, response_identifier
 from comparison.guard import HostedRequestGuard, RequestGuard
-from comparison.state import HistoryExpired, HistoryFull, validate_raw
+from comparison.state import HistoryFull, validate_raw
 from comparison.telemetry import configure_telemetry, record_evidence, telemetry_ids, tracer
 
 
@@ -156,13 +156,9 @@ def accumulate_partial(items, event):
 def snapshot(request, context, settings):
     result = {
         "id": context.response_id, "object": "response", "status": "in_progress",
-        "model": settings.model_deployment, "output": [], "store": request.get("store", True),
+        "model": settings.model_deployment, "output": [], "store": False,
         "created_at": int(context.created_at.timestamp()),
     }
-    if request.get("previous_response_id"):
-        result["previous_response_id"] = request["previous_response_id"]
-    if context.conversation_id:
-        result["conversation"] = {"id": context.conversation_id}
     return result
 
 
@@ -180,11 +176,10 @@ async def stream_response(client, settings, config, request, context, cancellati
     upstream_request_id = None
     try:
         async with asyncio.timeout(MODEL_TIMEOUT):
-            history = await interruptible(context.get_history(), cancellation_signal, context.shutdown)
-            if request.get("previous_response_id") and not history:
-                raise HistoryExpired()
+            if request.get("store") is True or request.get("conversation") or request.get("previous_response_id"):
+                raise ValueError("Hosted requests must supply inline history without persistence")
             current = await interruptible(context.get_input_items(), cancellation_signal, context.shutdown)
-            items = inline_items([*history, *current])
+            items = inline_items(current)
             if not items or items[-1].get("role") != "user":
                 raise ValueError("A current user message is required")
             headers = {"x-client-comparison-id": correlation_id(context.client_headers)}
@@ -275,9 +270,6 @@ async def stream_response(client, settings, config, request, context, cancellati
                     kind="UpstreamIncomplete" if envelope["status"] == "incomplete" else "UpstreamFailed",
                     status=upstream_status, request=upstream_request_id,
                 )
-    except HistoryExpired as exc:
-        diagnostic = failure("continuation", exc)
-        envelope.update(status="failed", error={"code": "conversation_expired", "message": "Hosted response history is unavailable. Reset to continue."})
     except CancelledStream as exc:
         diagnostic = failure(stage, exc)
         envelope.update(status="cancelled", error={"code": "cancelled", "message": "Request cancelled."})
@@ -329,7 +321,7 @@ def create_app(client=None, settings=None, store=None):
     os.environ.setdefault("AGENTSERVER_STATE_ROOT", ".runtime")
     host = ResponsesAgentServerHost(
         options=ResponsesServerOptions(default_fetch_history_count=MAX_RAW_ITEMS + 1),
-        store=store, configure_observability=None, access_log=None,
+        store=store if store is not None else InMemoryResponseProvider(), configure_observability=None, access_log=None,
         routes=[Route(path, health, methods=["GET"]) for path in ("/readiness", "/health", "/health/readiness")],
     )
     original_lifespan = host.router.lifespan_context

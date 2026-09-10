@@ -2,11 +2,12 @@ import io
 import json
 import logging
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import httpx2
 import pytest
-from azure.ai.agentserver.responses import InMemoryResponseProvider
+from azure.ai.agentserver.responses import InMemoryResponseProvider, ResponseContext
 from azure.core.exceptions import ClientAuthenticationError
 from azure.monitor.opentelemetry.exporter.export.trace._exporter import _convert_span_to_envelope
 from openai import BadRequestError, PermissionDeniedError
@@ -115,6 +116,9 @@ async def test_prompt_sdk_error_survives_as_safe_status_and_error_span(raw_respo
     assert args["max_output_tokens"] == 4096
     assert args["include"] == ["reasoning.encrypted_content"]
     assert result["hosted"]["error"] is None
+    assert result["hosted"]["continuation"] is None
+    assert clients["hosted"].responses.create.call_args.kwargs["store"] is False
+    clients["hosted"].conversations.create.assert_not_awaited()
     assert PRIVATE not in json.dumps(result)
     for span in exporter.get_finished_spans():
         if span.name in ("agent.prompt", "comparison"):
@@ -161,7 +165,9 @@ async def test_hosted_upstream_errors_reach_web_without_bodies(settings, raw_res
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=host), base_url="http://host") as caller:
             async def invoke(**kwargs):
                 headers = kwargs.pop("extra_headers")
-                raw = (await caller.post("/responses", json=kwargs, headers=headers)).json()
+                response = await caller.post("/responses", json=kwargs, headers=headers)
+                assert response.status_code == 200
+                raw = response.json()
                 return SimpleNamespace(model_dump=lambda **kwargs: raw)
             clients["hosted"].responses.create.side_effect = invoke
             result = await ComparisonService(clients, load_config()).compare(CompareRequest(message="Q"), COMPARISON_ID)
@@ -169,6 +175,14 @@ async def test_hosted_upstream_errors_reach_web_without_bodies(settings, raw_res
     expected = "hosted.model.responses.create"
     assert diagnostic == {"stage": expected, "type": "PermissionDeniedError", "http_status": 403, "request_id": REQUEST_ID}
     assert result["prompt"]["error"] is None
+    assert result["hosted"]["continuation"] is None
+    assert result["hosted"]["conversation_id"] is None
+    for upstream in (clients["hosted"], model):
+        args = upstream.responses.create.call_args.kwargs
+        assert args["store"] is False
+        assert "conversation" not in args
+        assert "previous_response_id" not in args
+        upstream.conversations.create.assert_not_awaited()
     assert PRIVATE not in json.dumps(result)
     model.conversations.create.assert_not_awaited()
     for span in exporter.get_finished_spans():
@@ -176,6 +190,114 @@ async def test_hosted_upstream_errors_reach_web_without_bodies(settings, raw_res
             assert span.status.status_code == StatusCode.ERROR
             assert span.attributes["http.response.status_code"] == 403
             assert _convert_span_to_envelope(span).data.base_data.success is False
+            assert span.events == ()
+            assert PRIVATE not in json.dumps(dict(span.attributes))
+
+
+async def test_stateless_hosted_roundtrip_preserves_trace_and_model_attribution(
+    settings, raw_response, recorded_spans, monkeypatch,
+):
+    _, exporter = recorded_spans
+    history = AsyncMock(side_effect=AssertionError("Hosted history must be supplied inline"))
+    monkeypatch.setattr(ResponseContext, "get_history", history)
+    model = fake_stream_client(raw_response)
+    host = hosted_app(model, settings, store=InMemoryResponseProvider())
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    wire_responses = []
+    results = []
+    web = create_app(ComparisonService(clients, load_config()))
+    async with host.router.lifespan_context(host), web.router.lifespan_context(web):
+        async with (
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=host), base_url="http://host") as host_client,
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=web), base_url="http://web") as browser,
+        ):
+            async def invoke(**kwargs):
+                headers = {
+                    **kwargs.pop("extra_headers"),
+                    "x-agent-foundry-call-id": "opaque-platform-call",
+                    "x-agent-user-id": PRIVATE,
+                }
+                response = await host_client.post("/responses", json=kwargs, headers=headers)
+                assert response.status_code == 200
+                raw = response.json()
+                wire_responses.append(raw)
+                return SimpleNamespace(model_dump=lambda **kwargs: raw)
+
+            clients["hosted"].responses.create.side_effect = invoke
+            transcript = []
+            for message in ("Question", "Follow up"):
+                response = await browser.post("/api/compare", json={
+                    "message": message, "history": {"hosted": transcript},
+                })
+                assert response.status_code == 200
+                result = response.json()
+                results.append(result)
+                transcript.extend([
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": result["hosted"]["text"]},
+                ])
+                assert (await host_client.get(f"/responses/{result['hosted']['response_id']}")).status_code == 404
+
+    spans = exporter.get_finished_spans()
+    for index, result in enumerate(results):
+        hosted = result["hosted"]
+        wire = wire_responses[index]
+        assert hosted["error"] is None
+        assert hosted["continuation"] is None
+        assert hosted["conversation_id"] is None
+        assert hosted["response_id"] == wire["id"]
+        assert hosted["response_id"] != raw_response["id"]
+        assert hosted["model_response_id"] == raw_response["id"]
+        assert wire["model"] == settings.model_deployment
+        assert wire["store"] is False
+        assert not wire.get("conversation")
+        assert not wire.get("previous_response_id")
+        assert "private-ciphertext" not in json.dumps(result)
+        assert PRIVATE not in json.dumps(result)
+        invocation = next(
+            span for span in spans
+            if span.name == "agent.hosted" and span.attributes["comparison.id"] == result["comparison_id"]
+        )
+        runtime = next(
+            span for span in spans
+            if span.name == "hosted.model" and span.attributes["comparison.id"] == result["comparison_id"]
+        )
+        assert runtime.parent.span_id == invocation.context.span_id
+        assert hosted["trace_id"] == hosted["hosted_runtime_trace_id"] == f"{runtime.context.trace_id:032x}"
+        assert hosted["span_id"] == f"{invocation.context.span_id:016x}"
+        assert hosted["hosted_runtime_span_id"] == f"{runtime.context.span_id:016x}"
+        assert hosted["span_id"] != hosted["hosted_runtime_span_id"]
+        assert invocation.attributes["gen_ai.response.id"] == wire["id"]
+        assert runtime.attributes["gen_ai.response.id"] == raw_response["id"]
+        assert "gen_ai.conversation.id" not in invocation.attributes
+        assert "gen_ai.conversation.id" not in runtime.attributes
+        assert invocation.status.status_code != StatusCode.ERROR
+        assert runtime.status.status_code != StatusCode.ERROR
+        outer = clients["hosted"].responses.create.call_args_list[index].kwargs
+        inner = model.responses.create.call_args_list[index].kwargs
+        for args in (outer, inner):
+            assert args["store"] is False
+            assert "conversation" not in args
+            assert "previous_response_id" not in args
+            assert args["max_output_tokens"] == 4096
+            assert args["include"] == ["reasoning.encrypted_content"]
+            assert args["extra_headers"]["x-client-comparison-id"] == result["comparison_id"]
+        assert outer["extra_headers"]["x-client-traceparent"].split("-")[1:3] == [
+            hosted["trace_id"], hosted["span_id"],
+        ]
+        assert inner["extra_headers"]["x-agent-foundry-call-id"] == "opaque-platform-call"
+        assert "x-agent-user-id" not in inner["extra_headers"]
+        assert inner["reasoning"] == {"effort": "low"}
+        assert inner["stream"] is True and outer["stream"] is False
+        assert inner["model"] == settings.model_deployment
+        assert [(item["role"], item["content"][0]["text"]) for item in inner["input"]] == [
+            (item["role"], item["content"]) for item in outer["input"]
+        ]
+        assert len(inner["input"]) == 2 * index + 1
+    assert wire_responses[0]["id"] != wire_responses[1]["id"]
+    history.assert_not_awaited()
+    clients["hosted"].conversations.create.assert_not_awaited()
+    model.conversations.create.assert_not_awaited()
 
 
 async def test_hosted_no_longer_requires_model_conversation_create(settings, raw_response):
@@ -184,9 +306,15 @@ async def test_hosted_no_longer_requires_model_conversation_create(settings, raw
     host = hosted_app(model, settings, store=InMemoryResponseProvider())
     async with host.router.lifespan_context(host):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=host), base_url="http://host") as caller:
-            result = (await caller.post("/responses", json={"input": "Q", "store": True})).json()
+            response = await caller.post("/responses", json={"input": "Q", "store": False})
+            assert response.status_code == 200
+            result = response.json()
+            assert (await caller.get(f"/responses/{result['id']}")).status_code == 404
     assert result["status"] == "completed"
     assert result["id"]
+    assert result["store"] is False
+    assert not result.get("conversation")
+    assert not result.get("previous_response_id")
     assert model.responses.create.call_args.kwargs["store"] is False
     model.conversations.create.assert_not_awaited()
 
@@ -202,13 +330,23 @@ async def test_hosted_terminal_failures_are_error_spans(settings, raw_response, 
     diagnostic = from_metadata(result)
     assert diagnostic["stage"] == "hosted.model.stream"
     assert diagnostic["type"] == ("UpstreamFailed" if status == "failed" else "UpstreamIncomplete")
+    assert result["status"] == status
+    assert result["store"] is False
+    assert not result.get("conversation")
+    assert not result.get("previous_response_id")
+    assert [
+        {key: value for key, value in item.items() if key != "response_id"}
+        for item in result["output"]
+    ] == raw_response["output"]
     span = next(span for span in exporter.get_finished_spans() if span.name == "hosted.model")
     assert span.status.status_code == StatusCode.ERROR
     assert _convert_span_to_envelope(span).data.base_data.success is False
+    assert span.events == ()
+    assert PRIVATE not in json.dumps(dict(span.attributes))
 
 
 def test_credential_failure_keeps_no_message_or_unknown_status():
-    diagnostic = failure("hosted.model.conversations.create", ClientAuthenticationError(PRIVATE))
+    diagnostic = failure("hosted.model.responses.create", ClientAuthenticationError(PRIVATE))
     assert diagnostic["type"] == "ClientAuthenticationError"
     assert diagnostic["http_status"] is None and diagnostic["request_id"] is None
     assert PRIVATE not in json.dumps(diagnostic)
