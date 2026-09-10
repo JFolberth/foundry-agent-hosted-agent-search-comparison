@@ -395,7 +395,10 @@ async def test_three_browser_posts_resend_transcript_without_stored_get_or_sdk_h
         for actual, message in zip(call["input"], expected):
             assert actual.get("type", "message") == "message"
             assert actual["role"] == message["role"]
-            assert actual["content"] == [{"type": "input_text", "text": message["content"]}]
+            assert actual["content"] == [{
+                "type": "output_text" if message["role"] == "assistant" else "input_text",
+                "text": message["content"],
+            }]
         assert call["store"] is False and call["stream"] is True
         assert call["include"] == ["reasoning.encrypted_content"]
         assert call["extra_headers"]["x-agent-foundry-call-id"] == f"platform-turn-{index}"

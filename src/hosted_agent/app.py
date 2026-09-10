@@ -47,6 +47,12 @@ def inline_items(items):
             allowed = ("input_text", "output_text", "refusal") if item["role"] == "assistant" else ("input_text",)
             if any(part.get("type") not in allowed for part in content):
                 raise ValueError("Only text content is supported")
+            if item["role"] == "assistant":
+                # AgentServer expands all string content as input_text, but the
+                # model Responses API requires output_text for assistant history.
+                for part in content:
+                    if part["type"] == "input_text":
+                        part["type"] = "output_text"
         # Hosted response ownership is distinct from the model's response store.
         item.pop("response_id", None)
         item.pop("agent_reference", None)

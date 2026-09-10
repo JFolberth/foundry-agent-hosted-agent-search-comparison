@@ -138,8 +138,10 @@ async def test_hosted_followup_resends_only_explicit_transcript(settings, raw_re
             assert len(first_args["input"]) == 3
             assert [item["role"] for item in first_args["input"]] == ["user", "assistant", "user"]
             assert [item["content"] for item in first_args["input"]] == [
-                [{"type": "input_text", "text": text}]
-                for text in ("Earlier", "Earlier answer", "Question")
+                [{"type": kind, "text": text}]
+                for kind, text in (
+                    ("input_text", "Earlier"), ("output_text", "Earlier answer"), ("input_text", "Question")
+                )
             ]
             assert first_args["store"] is False
             response_id = first.json()["id"]
@@ -159,7 +161,9 @@ async def test_hosted_followup_resends_only_explicit_transcript(settings, raw_re
             assert args["store"] is False
             assert args["stream"] is True
             assert args["input"] == [
-                {"type": "message", "role": item["role"], "content": [{"type": "input_text", "text": item["content"]}]}
+                {"type": "message", "role": item["role"], "content": [{
+                    "type": "output_text" if item["role"] == "assistant" else "input_text", "text": item["content"],
+                }]}
                 for item in transcript
             ]
             assert "private-ciphertext" not in json.dumps(args["input"])
@@ -336,7 +340,7 @@ async def test_hosted_transcript_can_branch_without_server_history(settings, raw
                 assert len(args["input"]) == 3
                 assert args["input"][0] == initial_input[0]
                 assert args["input"][1] == {
-                    "type": "message", "role": "assistant", "content": [{"type": "input_text", "text": "Indexed answer."}],
+                    "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Indexed answer."}],
                 }
                 assert args["input"][-1]["content"] == [{"type": "input_text", "text": message}]
                 assert args["store"] is False
