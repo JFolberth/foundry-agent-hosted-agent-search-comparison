@@ -1,7 +1,7 @@
 import json
 import pytest
 
-from comparison.evidence import extract_evidence, safe_url
+from comparison.evidence import extract_evidence, safe_url, strip_citation_markers
 
 
 def test_model_response_id_is_separate_from_the_invoked_agent_response():
@@ -38,6 +38,26 @@ def test_real_evidence_usage_ids_citations_preserved(raw_response):
     assert result["citations"][0]["title"] == "Source"
     assert result["response_id"] == "resp_native"
     assert "private-ciphertext" not in json.dumps(result)
+
+
+def test_inline_citation_markers_are_stripped_from_displayed_text(raw_response):
+    raw_response["output"][-1]["content"][0]["text"] = (
+        "GrandPre\u30104:0\u2020source\u3011 recommends this book\u301012:3\u2020source\u3011."
+    )
+    result = extract_evidence(raw_response)
+    assert "\u3010" not in result["text"] and "\u3011" not in result["text"]
+    assert result["text"] == "GrandPre recommends this book."
+    # The structured citation is still captured separately for programmatic use.
+    assert result["citations"][0]["title"] == "Source"
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("Plain text with no markers.", "Plain text with no markers."),
+    ("Before\u30105:1\u2020source\u3011after", "Beforeafter"),
+    ("\u3010unterminated", "\u3010unterminated"),
+])
+def test_strip_citation_markers_handles_edge_cases(value, expected):
+    assert strip_citation_markers(value) == expected
 
 
 def test_missing_telemetry_is_unknown_not_zero(raw_response):

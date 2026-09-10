@@ -6,6 +6,17 @@ MAX_TEXT = 12000
 MAX_EVIDENCE_CHARS = 32000
 MAX_CALLS = 24
 MAX_CITATIONS = 40
+# The Responses API inlines file/search citation markers directly into
+# output_text, e.g. "...GrandPre.\u30104:0\u2020source\u3011" (\u3010...\u3011
+# lenticular brackets around an index and a \u2020-separated label). There is
+# no request-time switch to suppress these; they must be stripped from the
+# displayed answer text ourselves. The citations remain available separately
+# via the annotations list captured below.
+_CITATION_MARKER_RE = re.compile(r"\u3010[^\u3010\u3011]{0,80}\u3011")
+
+
+def strip_citation_markers(value: str) -> str:
+    return re.sub(r"[ \t]{2,}", " ", _CITATION_MARKER_RE.sub("", value))
 _PRIVATE_KEYS = {
     "authorization", "api_key", "apikey", "access_token", "secret", "password",
     "connection_string", "encrypted_content", "reasoning", "summary",
@@ -153,7 +164,7 @@ def extract_evidence(raw: dict, *, hosted: bool = False) -> dict:
     available = bool(calls)
     metadata = raw.get("metadata") if hosted and isinstance(raw.get("metadata"), dict) else {}
     return {
-        "text": clean_text("\n".join(text)),
+        "text": strip_citation_markers(clean_text("\n".join(text))),
         "error": None,
         "usage": _usage(raw.get("usage")),
         "tool_calls": calls,
