@@ -1,25 +1,19 @@
-# Explicit single-operator DEVELOPMENT bootstrap only; no existing state is migrated.
-# State contains the App Insights connection string. Keep it on an encrypted disk,
-# restrict filesystem access, and never upload state or .terraform/ to GitHub.
+# Remote backend: Azure Storage (saterraformstatedevswc / rg-terraformstate-dev /
+# container "tfstate"). State contains the App Insights connection string; access
+# to the storage account/container is restricted via RBAC (Storage Blob Data
+# Contributor), not filesystem permissions.
 #
-# Before sharing this deployment or using production infrastructure, provision an
-# Azure Storage state account/container in a separately approved bootstrap lifecycle,
-# enable encryption and blob versioning, and grant the Terraform identity Storage
-# Blob Data Contributor on the container. Backend storage must outlive this root.
-#
-# Replace the local block below with: backend "azurerm" {}
-# Copy backend.hcl.example to ignored backend.hcl and fill in its values.
-# From infra/, initialize the new backend explicitly:
+# infra/backend.hcl is gitignored and holds the actual (non-secret) backend
+# config values; copy backend.hcl.example if you need to recreate it locally.
+# From infra/, initialize explicitly:
 #   terraform init -backend-config=backend.hcl
-# If local state already exists, migration requires separate approval and
+# Migrating existing local state into this backend (one-time, already done for
+# this repo) requires separate approval and:
 #   terraform init -migrate-state -backend-config=backend.hcl
-# Never use -migrate-state for an empty initial deployment.
 #
 # "azurerm" here is Terraform's built-in Azure Blob BACKEND, not a provider.
 # The only resource provider remains Azure/azapi.
 # https://developer.hashicorp.com/terraform/language/backend/azurerm
 terraform {
-  backend "local" {
-    path = "terraform.tfstate"
-  }
+  backend "azurerm" {}
 }
