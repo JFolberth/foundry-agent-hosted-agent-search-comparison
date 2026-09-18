@@ -39,9 +39,20 @@ class Settings(BaseModel):
     hosted_agent: str
     prompt_agent_none: str | None = None
     hosted_agent_none: str | None = None
+    aca_endpoint: str | None = None
+    aca_endpoint_none: str | None = None
 
     @model_validator(mode="after")
     def validate_fixed_endpoints(self):
+        if (self.aca_endpoint is None) != (self.aca_endpoint_none is None):
+            raise ValueError("Both ACA endpoints must be configured together")
+        for value in (self.aca_endpoint, self.aca_endpoint_none):
+            if value is None:
+                continue
+            if not re.fullmatch(r"https://[a-z0-9-]+\.internal\.[a-z0-9.-]+\.azurecontainerapps\.io/?", value):
+                raise ValueError("A fixed internal HTTPS ACA endpoint is required")
+        if self.aca_endpoint and self.aca_endpoint.rstrip("/") == self.aca_endpoint_none.rstrip("/"):
+            raise ValueError("ACA endpoints must be distinct")
         endpoint = urlsplit(self.project_endpoint)
         if (
             endpoint.scheme != "https"
@@ -82,6 +93,8 @@ class Settings(BaseModel):
         optional_names = {
             "prompt_agent_none": "PROMPT_AGENT_NAME_NONE",
             "hosted_agent_none": "HOSTED_AGENT_NAME_NONE",
+            "aca_endpoint": "ACA_ENDPOINT",
+            "aca_endpoint_none": "ACA_ENDPOINT_NONE",
         }
         for key, env_name in optional_names.items():
             if env_name in os.environ:

@@ -12,11 +12,13 @@ hosted_image           = null
 location               = "swedencentral"
 model_capacity         = 460 # Legacy foundation deployment; orphaned/unused, kept only to avoid a foundation-stage change.
 model_deployment_name  = "gpt-5.6-terra"
-model_deployments = { # Dedicated per-agent deployments (equal capacity keeps the comparison fair); 4x80=320 fits comfortably under the swedencentral GlobalStandard quota headroom.
-  prompt      = { name = "gpt-5.6-terra-prompt", capacity = 80 }
-  prompt_none = { name = "gpt-5.6-terra-prompt-none", capacity = 80 }
-  hosted      = { name = "gpt-5.6-terra-hosted", capacity = 80 }
-  hosted_none = { name = "gpt-5.6-terra-hosted-none", capacity = 80 }
+model_deployments = { # Six dedicated deployments; verify quota including the legacy foundation deployment before applying.
+  prompt      = { name = "gpt-5.6-terra-prompt", capacity = 64 }
+  prompt_none = { name = "gpt-5.6-terra-prompt-none", capacity = 64 }
+  hosted      = { name = "gpt-5.6-terra-hosted", capacity = 64 }
+  hosted_none = { name = "gpt-5.6-terra-hosted-none", capacity = 64 }
+  aca         = { name = "gpt-5.6-terra-aca", capacity = 64 }
+  aca_none    = { name = "gpt-5.6-terra-aca-none", capacity = 64 }
 }
 model_name             = "gpt-5.6-terra"
 model_version          = "2026-07-09"

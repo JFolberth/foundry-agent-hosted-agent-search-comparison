@@ -26,10 +26,12 @@ class History(StrictModel):
     hosted: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
     prompt_none: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
     hosted_none: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
+    aca: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
+    aca_none: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
 
     @model_validator(mode="after")
     def total_content(self):
-        for messages in (self.prompt, self.hosted, self.prompt_none, self.hosted_none):
+        for messages in (self.prompt, self.hosted, self.prompt_none, self.hosted_none, self.aca, self.aca_none):
             if sum(len(m.content) for m in messages) > MAX_HISTORY_CHARS:
                 raise ValueError("History exceeds character limit")
         return self
@@ -40,6 +42,8 @@ class Continuation(StrictModel):
     hosted: str | None = Field(default=None, min_length=40, max_length=64, pattern=r"^[\w-]+$")
     prompt_none: str | None = Field(default=None, min_length=40, max_length=64, pattern=r"^[\w-]+$")
     hosted_none: str | None = Field(default=None, min_length=40, max_length=64, pattern=r"^[\w-]+$")
+    aca: None = None
+    aca_none: None = None
 
 
 class HostedSession(StrictModel):

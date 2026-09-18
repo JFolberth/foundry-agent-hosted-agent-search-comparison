@@ -64,6 +64,7 @@ module "workloads" {
   source = "./modules/workloads"
 
   account_id                             = module.foundry.account_id
+  aca_bootstrap                          = var.aca_bootstrap
   agent_config                           = local.agent_config
   application_insights_connection_string = module.platform.application_insights_connection_string
   container_apps_environment_id          = module.platform.container_apps_environment_id
@@ -76,13 +77,16 @@ module "workloads" {
   model_version                          = var.model_version
   name_token                             = local.name_token
   project_endpoint                       = module.foundry.project_endpoint
+  project_id                             = module.foundry.project_id
   prompt_agent_name                      = var.prompt_agent_name
   prompt_agent_name_none                 = var.prompt_agent_name_none
   registry_login_server                  = module.platform.registry_login_server
+  registry_id                            = module.platform.registry_id
   resource_group_id                      = module.platform.resource_group_id
   search_index_name                      = module.search.index_name
   search_project_connection_id           = module.foundry.search_project_connection_id
   tags                                   = local.tags
+  subscription_id                        = var.subscription_id
   ui_identity_client_id                  = module.platform.ui_identity_client_id
   ui_identity_id                         = module.platform.ui_identity_id
   web_image                              = var.web_image

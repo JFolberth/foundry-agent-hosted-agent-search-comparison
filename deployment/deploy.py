@@ -39,6 +39,12 @@ AGENT_SIDES = {
     "prompt_none": {"kind": "prompt", "reasoning": "none"},
     "hosted_none": {"kind": "hosted", "reasoning": "none"},
 }
+ACA_SIDES = {"aca": "low", "aca_none": "none"}
+MODEL_SIDES = (*AGENT_SIDES, *ACA_SIDES)
+ACA_BOOTSTRAP_IMAGE = "mcr.microsoft.com/k8se/quickstart@sha256:3a4d93c34c6753f24765ab17a36f1754aee9b02082b7d9553d17697b9e8252c4"
+ACA_ADDRESSES = {f'module.workloads[0].azapi_resource.aca["{side}"]' for side in ACA_SIDES}
+ACA_ASSIGNMENTS = {f'module.workloads[0].azapi_resource.aca_assignment["{side}_{role}"]'
+                   for side in ACA_SIDES for role in ("acr_pull", "foundry")}
 DOCKERIGNORE = """**
 !pyproject.toml
 !uv.lock
@@ -730,7 +736,55 @@ def changes_present(plan):
                for c in resource_changes + output_changes)
 
 
-def workload_foundation_guard(plan):
+def model_capacity_context(session):
+    values = session.state()
+    resources = state_resources(values)
+    hosted = resources["module.workloads[0].azapi_data_plane_resource.hosted"]["values"]
+    web = resources["module.workloads[0].azapi_resource.web"]["values"]
+    images = {
+        "hosted_image": hosted["body"]["definition"]["container_configuration"]["image"],
+        "web_image": web["body"]["properties"]["template"]["containers"][0]["image"],
+    }
+    return {"images": images, "state_sha256": source_hash(values)}
+
+
+def model_capacity_guard(plan):
+    variables = {key: value.get("value") for key, value in plan.get("variables", {}).items()}
+    deployments = variables.get("model_deployments", {})
+    require(set(deployments) == set(MODEL_SIDES), "Capacity plan requires all six configured models.")
+    capacities = [deployment.get("capacity") for deployment in deployments.values()]
+    require(all(type(capacity) in (int, float) and 1 <= capacity <= 1000 and int(capacity) == capacity
+                for capacity in capacities) and len(set(capacities)) == 1,
+            "Capacity plan requires one equal positive integer capacity for all six models.")
+    desired = capacities[0]
+    allowed = {f'module.workloads[0].azapi_resource.model["{side}"]': side for side in AGENT_SIDES}
+    seen = set()
+    for resource in plan.get("resource_changes", []):
+        change = resource.get("change", {})
+        actions = change.get("actions")
+        require(not change.get("importing") and not resource.get("previous_address"),
+                "Capacity plan cannot import or move resources.")
+        if actions == ["no-op"] or (resource.get("mode") == "data" and actions == ["read"]):
+            continue
+        address = resource.get("address")
+        require(address in allowed and address not in seen and resource.get("mode") == "managed"
+                and actions == ["update"], "Capacity plan permits only updates to the four existing dedicated models.")
+        before, after = change.get("before") or {}, change.get("after") or {}
+        old_body, new_body = before.get("body") or {}, after.get("body") or {}
+        old_sku, new_sku = old_body.get("sku") or {}, new_body.get("sku") or {}
+        require(type(old_sku.get("capacity")) in (int, float) and desired < old_sku["capacity"]
+                and new_sku == {**old_sku, "capacity": desired}
+                and new_body == {**old_body, "sku": new_sku}
+                and before.get("type") == "Microsoft.CognitiveServices/accounts/deployments@2026-03-01"
+                and after.get("name") == deployments[allowed[address]].get("name")
+                and {key: value for key, value in before.items() if key not in ("body", "output")}
+                == {key: value for key, value in after.items() if key not in ("body", "output")},
+                "Capacity plan must only reduce capacity, preserving model, version, scope and request settings.")
+        seen.add(address)
+    require(seen == set(allowed), "Capacity plan must reduce exactly all four existing dedicated models.")
+
+
+def workload_foundation_guard(plan, bootstrap=False):
     workloads = {
         "module.search.azapi_data_plane_resource.index[0]",
         "module.workloads[0].azapi_data_plane_resource.prompt",
@@ -738,7 +792,11 @@ def workload_foundation_guard(plan):
         "module.workloads[0].azapi_data_plane_resource.prompt_none",
         "module.workloads[0].azapi_data_plane_resource.hosted_none",
         "module.workloads[0].azapi_resource.web",
-    } | {f'module.workloads[0].azapi_resource.model["{side}"]' for side in AGENT_SIDES}
+    } | {f'module.workloads[0].azapi_resource.model["{side}"]' for side in MODEL_SIDES} | ACA_ADDRESSES
+    if bootstrap:
+        workloads = ACA_ADDRESSES | ACA_ASSIGNMENTS | {
+            f'module.workloads[0].azapi_resource.model["{side}"]' for side in MODEL_SIDES
+        }
     for resource in plan.get("resource_changes", []):
         actions = resource.get("change", {}).get("actions")
         if actions == ["no-op"] or (resource.get("mode") == "data" and actions == ["read"]):
@@ -747,6 +805,100 @@ def workload_foundation_guard(plan):
                 "Workload plan changes foundational resources or RBAC; permission checks against "
                 "old parents are insufficient. Separately approve/re-stage foundations first, "
                 "then create a fresh workload plan. No automatic migration or apply is allowed.")
+        if bootstrap:
+            require(actions == ["create"] and resource["change"].get("before") is None
+                    and not resource["change"].get("importing") and not resource.get("previous_address"),
+                    "ACA bootstrap permits only new apps, their grants and dedicated models; no updates or replacements.")
+        elif resource.get("address") in ACA_ADDRESSES:
+            require(actions == ["update"], "Apply plan-aca-bootstrap before deploying private ACA images; replacements are refused.")
+
+
+def aca_plan_guard(plan, images, bootstrap=False):
+    prior_values = plan.get("prior_state", {}).get("values", {})
+    prior = {key: value.get("value") for key, value in prior_values.get("outputs", {}).items()}
+    resources = state_resources(plan.get("planned_values", {}))
+    previous = state_resources(prior_values)
+    required = ("resource_group_id", "container_apps_environment_id", "registry_id",
+                "registry_login_server", "project_id", "project_endpoint", "search_index_name",
+                "search_project_connection_id")
+    require(all(isinstance(prior.get(key), str) and prior[key] for key in required),
+            "ACA plans require known applied foundation scopes and endpoints.")
+    roles = {"acr_pull": (prior["registry_id"], "7f951dda-4ed3-4680-a7ca-43fe172d538d"),
+             "foundry": (prior["project_id"], "53ca6127-db72-4b80-b1b0-d745d6d5456d")}
+    for side, reasoning in ACA_SIDES.items():
+        address = f'module.workloads[0].azapi_resource.aca["{side}"]'
+        value = resources.get(address, {}).get("values", {})
+        identity = value.get("identity") or []
+        properties = (value.get("body") or {}).get("properties", {})
+        configuration = properties.get("configuration", {})
+        ingress = configuration.get("ingress", {})
+        template = properties.get("template", {})
+        containers = template.get("containers", [])
+        require(value.get("type") == "Microsoft.App/containerApps@2025-01-01"
+                and value.get("parent_id") == prior["resource_group_id"]
+                and len(identity) == 1 and identity[0].get("type") == "SystemAssigned"
+                and not identity[0].get("identity_ids")
+                and properties.get("environmentId") == prior["container_apps_environment_id"]
+                and configuration.get("activeRevisionsMode") == "Single"
+                and configuration.get("identitySettings") == [{"identity": "system", "lifecycle": "None" if bootstrap else "Main"}]
+                and ingress.get("external") is False and ingress.get("allowInsecure") is False
+                and ingress.get("targetPort") == (80 if bootstrap else 8088)
+                and len(containers) == 1 and containers[0].get("name") == "agent"
+                and containers[0].get("resources") == {"cpu": 1, "memory": "2Gi"}
+                and template.get("scale") == {"minReplicas": 0 if bootstrap else 1, "maxReplicas": 1},
+                f"{side}: expected an internal system-assigned ACA runtime in the applied environment.")
+        container = containers[0]
+        require(container.get("image") == (ACA_BOOTSTRAP_IMAGE if bootstrap else images["hosted_image"])
+                and not container.get("command") and not container.get("args"),
+                f"{side}: ACA must reuse the approved image and entrypoint.")
+        old = previous.get(address, {}).get("values", {})
+        if bootstrap:
+            old_containers = (old.get("body") or {}).get("properties", {}).get("template", {}).get("containers", [])
+            require(not old_containers or old_containers[0].get("image") == ACA_BOOTSTRAP_IMAGE,
+                    "Cannot re-bootstrap an active ACA runtime.")
+            require(not container.get("env") and not configuration.get("secrets")
+                    and not configuration.get("registries"), "Bootstrap image must receive no runtime configuration or credentials.")
+        else:
+            principal = (old.get("identity") or [{}])[0].get("principal_id")
+            require(isinstance(principal, str) and GUID.fullmatch(principal.lower()),
+                    "Apply plan-aca-bootstrap first; private image pulls require an existing system identity.")
+            require(configuration.get("registries") == [{"server": prior["registry_login_server"], "identity": "system"}],
+                    "Private ACA image pulls must use the app's system identity.")
+            environment = {entry["name"]: entry.get("value") for entry in container.get("env", [])}
+            models = resources.get(f'module.workloads[0].azapi_resource.model["{side}"]', {}).get("values", {})
+            expected = {
+                "FOUNDRY_PROJECT_ENDPOINT": prior["project_endpoint"],
+                "MODEL_DEPLOYMENT_NAME": models.get("name"),
+                "SEARCH_INDEX_NAME": prior["search_index_name"],
+                "SEARCH_PROJECT_CONNECTION_ID": prior["search_project_connection_id"],
+                "MANAGED_IDENTITY_MODE": "system", "RUNTIME_SIDE": side,
+                "REASONING_EFFORT_OVERRIDE": reasoning,
+            }
+            require(models.get("name") and all(environment.get(key) == expected_value
+                                               for key, expected_value in expected.items())
+                    and set(environment) == set(expected) | {"HOSTED_AGENT_NAME", "PROMPT_AGENT_NAME", "APPLICATIONINSIGHTS_CONNECTION_STRING"},
+                    f"{side}: unexpected model, reasoning, Search, identity or runtime environment.")
+        principal = identity[0].get("principal_id")
+        for role, (scope, role_id) in roles.items():
+            assignment_address = f'module.workloads[0].azapi_resource.aca_assignment["{side}_{role}"]'
+            assignment = resources.get(assignment_address, {}).get("values", {})
+            role_properties = (assignment.get("body") or {}).get("properties", {})
+            require(assignment.get("type") == "Microsoft.Authorization/roleAssignments@2022-04-01"
+                    and assignment.get("parent_id") == scope
+                    and {"principalType", "roleDefinitionId"} <= set(role_properties)
+                    <= {"principalId", "principalType", "roleDefinitionId"}
+                    and role_properties.get("principalType") == "ServicePrincipal"
+                    and role_properties.get("roleDefinitionId") == scope.split("/resourceGroups/")[0]
+                    + "/providers/Microsoft.Authorization/roleDefinitions/" + role_id,
+                    f"{side}: ACA grants must be only AcrPull and project Foundry User.")
+            if principal:
+                require(role_properties.get("principalId") == principal,
+                        "ACA role assignment principal must match the app's system identity.")
+            else:
+                require(bootstrap and role_properties.get("principalId") is None,
+                        "Only bootstrap may have a pending system principal.")
+            if not bootstrap:
+                require(assignment_address in previous, "ACA grants must already exist before private-image deployment.")
 
 
 def project_search_rbac_context(session):
@@ -874,6 +1026,8 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
     for key, value in session.target.items():
         require(variables.get(key) == value, f"Saved plan target mismatch: {key}")
     require(variables.get("deploy_workloads") is (stage != "foundation"), "Saved plan stage mismatch.")
+    require(variables.get("aca_bootstrap", False) is (stage == "aca-bootstrap"),
+            "Saved plan ACA bootstrap stage mismatch.")
     prior_values = plan.get("prior_state", {}).get("values", {})
     prior = prior_values.get("outputs", {})
     if stage == "foundation":
@@ -883,11 +1037,20 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
         require(images is not None, "Workloads plan requires verified image provenance.")
         if stage == "project-search-rbac":
             project_search_rbac_guard(session, plan, rbac_context)
+        elif stage == "model-capacity":
+            model_capacity_guard(plan)
         else:
-            workload_foundation_guard(plan)
+            workload_foundation_guard(plan, bootstrap=stage == "aca-bootstrap")
         for key, value in images.items():
             require(variables.get(key) == value, "Saved plan image differs from approved build.")
     planned = plan.get("planned_values", {}).get("outputs", {}).get("deploy_workloads", {})
+    if stage in ("model-capacity", "aca-bootstrap") and not planned:
+        require(prior.get("deploy_workloads", {}).get("value") is True,
+                "Targeted stage requires existing enabled workloads when its output is omitted.")
+        planned = prior["deploy_workloads"]
+    if stage == "model-capacity":
+        require(prior.get("deploy_workloads", {}).get("value") is True,
+                "Capacity reduction requires existing enabled workloads.")
     require(planned.get("value") is (stage != "foundation"),
             "Root must output deploy_workloads with the planned stage value.")
     modules = [plan.get("planned_values", {}).get("root_module", {})]
@@ -899,7 +1062,7 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
         modules.extend(module.get("child_modules", []))
         for resource in module.get("resources", []):
             definition = (resource.get("values", {}).get("body") or {}).get("definition", {})
-            if (stage == "workloads" and resource.get("address") in {
+            if (stage in ("workloads", "aca-bootstrap") and resource.get("address") in {
                     f"module.workloads[0].azapi_data_plane_resource.{side}" for side in AGENT_SIDES
             } and definition):
                 side = resource["address"].rsplit(".", 1)[1]
@@ -907,7 +1070,7 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
                         == definition,
                         "Saved plan contains unsupported managed definition fields; review the verifier first.")
                 planned_definitions[side] = definition
-            if stage == "workloads":
+            if stage in ("workloads", "aca-bootstrap"):
                 model_match = model_address.match(resource.get("address", ""))
                 if model_match:
                     planned_models[model_match.group(1)] = resource.get("values", {}) or {}
@@ -920,9 +1083,10 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
                     "Rebuild compatible images and create a fresh plan; "
                     "deprecated or legacy protocol configuration cannot be approved.",
                 )
-    if stage == "workloads":
+    if stage in ("workloads", "aca-bootstrap"):
         require_paired_reasoning_only_diff(planned_definitions)
         require_equivalent_dedicated_models(planned_models)
+        aca_plan_guard(plan, images, bootstrap=stage == "aca-bootstrap")
 
 
 def show_plan(session, binary):
@@ -941,6 +1105,9 @@ def plan_stage(session, stage):
     elif stage == "project-search-rbac":
         rbac_context = project_search_rbac_context(session)
         images = rbac_context["images"]
+    elif stage == "model-capacity":
+        rbac_context = model_capacity_context(session)
+        images = rbac_context["images"]
     else:
         images, provenance = image_inputs(session, outputs)
         permission_readiness(session, timeout=getattr(session.args, "timeout", 600))
@@ -948,16 +1115,21 @@ def plan_stage(session, stage):
     tfvars_hash = digest(session.tfvars.read_bytes())
     folder = private_dir(ARTIFACTS / "plans" / f"{stage}-{uuid.uuid4().hex}")
     binary = folder / "plan.bin"
-    values = {**session.target, "deploy_workloads": stage != "foundation"}
+    values = {**session.target, "deploy_workloads": stage != "foundation",
+              "aca_bootstrap": stage == "aca-bootstrap"}
     if stage == "foundation":
         values.update(hosted_image=None, web_image=None)
-    elif stage == "project-search-rbac":
+    elif stage in ("project-search-rbac", "model-capacity"):
         values.update(images)
     overrides = folder / "stage.tfvars.json"
     write_json(overrides, values)
     args = ["plan", "-input=false", "-no-color", "-lock-timeout=60s",
             "-detailed-exitcode", f"-var-file={session.tfvars}"]
-    if images and stage != "project-search-rbac":
+    if stage == "aca-bootstrap":
+        args.extend(f"-target={address}" for address in sorted(ACA_ASSIGNMENTS))
+    if stage == "model-capacity":
+        args.extend(f'-target=module.workloads[0].azapi_resource.model["{side}"]' for side in AGENT_SIDES)
+    if images and stage not in ("project-search-rbac", "model-capacity"):
         args.append(f"-var-file={ARTIFACTS / 'images.tfvars.json'}")
     args += [f"-var-file={overrides}", f"-out={binary}"]
     session.tf(*args, log=folder / "plan.log", accepted=(0, 2))
@@ -967,7 +1139,8 @@ def plan_stage(session, stage):
     require(inputs == infra_inputs() and tfvars_hash == digest(session.tfvars.read_bytes()),
             "Inputs changed during planning; discard this plan and explicitly plan again.")
     if rbac_context:
-        require(project_search_rbac_context(session) == rbac_context,
+        current_context = model_capacity_context(session) if stage == "model-capacity" else project_search_rbac_context(session)
+        require(current_context == rbac_context,
                 "Authenticated RBAC target or applied image/state changed during planning; discard the plan.")
     elif images:
         require(image_inputs(session, session.outputs()) == (images, provenance),
@@ -1000,12 +1173,12 @@ def apply_stage(session):
         session.foundation_safe(outputs)
     images = None
     rbac_context = None
-    if stage == "workloads":
+    if stage in ("workloads", "aca-bootstrap"):
         images, provenance = image_inputs(session, outputs)
         require(images == record["images"] and provenance == record["provenance"],
                 "Saved plan does not match current approved image provenance.")
-    elif stage == "project-search-rbac":
-        rbac_context = project_search_rbac_context(session)
+    elif stage in ("project-search-rbac", "model-capacity"):
+        rbac_context = model_capacity_context(session) if stage == "model-capacity" else project_search_rbac_context(session)
         images = rbac_context["images"]
         require(rbac_context == record.get("rbac_context") and images == record["images"],
                 "Applied state/images or authenticated RBAC target changed; create a fresh RBAC plan.")
@@ -1015,10 +1188,10 @@ def apply_stage(session):
         require(digest(regular(binary).read_bytes()) == record["sha256"], "Saved binary plan hash changed.")
         require(record["tfvars_sha256"] == digest(session.tfvars.read_bytes())
                 and record["infra_inputs"] == infra_inputs(), "Inputs changed; explicitly create a new plan.")
-        if stage == "workloads":
+        if stage in ("workloads", "aca-bootstrap"):
             require(image_inputs(session, outputs) == (record["images"], record["provenance"]),
                     "Image inputs changed after plan approval.")
-        elif stage == "project-search-rbac":
+        elif stage in ("project-search-rbac", "model-capacity"):
             require(source_hash(session.state()) == rbac_context["state_sha256"],
                     "Applied state changed after RBAC plan approval; create a fresh plan.")
 
@@ -1034,8 +1207,9 @@ def apply_stage(session):
     unchanged()
     if stage == "foundation":
         session.foundation_safe(session.outputs())
-    elif stage == "project-search-rbac":
-        require(project_search_rbac_context(session) == rbac_context,
+    elif stage in ("project-search-rbac", "model-capacity"):
+        current_context = model_capacity_context(session) if stage == "model-capacity" else project_search_rbac_context(session)
+        require(current_context == rbac_context,
                 "Authenticated RBAC scope/principal changed after approval; no apply performed.")
         unchanged()
     else:
@@ -1279,13 +1453,13 @@ def require_paired_reasoning_only_diff(definitions):
 
 
 def require_equivalent_dedicated_models(model_values):
-    """Each of the four experiment-scoped model deployments (one per agent
+    """Each of the six experiment-scoped model deployments (one per agent
     side, isolating TPM/RPM budgets so agents cannot contend with each other)
     must use the same verified model name/version/capacity and a distinct
     deployment name. Isolation for fairness, not a difference in model or
     capacity, is the only intended variation here."""
-    require(set(model_values) == set(AGENT_SIDES) or not model_values,
-            "All four dedicated per-agent model deployments must be present.")
+    require(set(model_values) == set(MODEL_SIDES) or not model_values,
+            "All six dedicated per-agent model deployments must be present.")
     if not model_values:
         return
     names = {side: value.get("name") for side, value in model_values.items()}
@@ -1342,7 +1516,7 @@ def applied_targets(session):
     require_paired_reasoning_only_diff(definitions)
     model_values = {
         side: resources.get(f'module.workloads[0].azapi_resource.model["{side}"]', {}).get("values", {}) or {}
-        for side in AGENT_SIDES
+        for side in MODEL_SIDES
     }
     require_equivalent_dedicated_models(model_values)
     targets["definitions"] = definitions
@@ -1658,6 +1832,43 @@ def route_agents(session):
                   "Rerun route-agents for a new proposal covering only remaining differences.")
 
 
+def verify_aca(session, outputs):
+    values = session.state()
+    resources = state_resources(values)
+    require(outputs.get("aca_bootstrap") is not True, "ACA bootstrap is incomplete; apply the private runtime workload plan.")
+    for side in ACA_SIDES:
+        value = resources.get(f'module.workloads[0].azapi_resource.aca["{side}"]', {}).get("values", {})
+        resource_id = value.get("id")
+        require(isinstance(resource_id, str) and resource_id.startswith(outputs.get("resource_group_id", "") + "/providers/Microsoft.App/containerApps/"),
+                "Missing applied ACA app in the approved resource group.")
+        remote = azure_request(session, "https://management.azure.com" + resource_id + "?api-version=2025-01-01",
+                               "https://management.azure.com/")
+        properties = remote.get("properties", {})
+        identity = remote.get("identity", {})
+        expected = value["body"]["properties"]
+        configuration = properties.get("configuration", {})
+        require(remote.get("id", "").lower() == resource_id.lower()
+                and properties.get("provisioningState") == "Succeeded"
+                and properties.get("runningStatus") == "Running"
+                and properties.get("latestRevisionName")
+                and properties.get("latestReadyRevisionName") == properties["latestRevisionName"]
+                and identity.get("type") == "SystemAssigned"
+                and identity.get("principalId") == value["identity"][0]["principal_id"]
+                and configuration.get("ingress", {}).get("external") is False
+                and configuration.get("ingress", {}).get("targetPort") == 8088
+                and properties.get("environmentId") == expected["environmentId"],
+                f"{side}: ACA system identity, internal ingress or latest revision is not ready.")
+        containers = properties.get("template", {}).get("containers", [])
+        desired = expected["template"]["containers"]
+        require(len(containers) == 1 and containers[0].get("image") == desired[0]["image"]
+                and containers[0].get("image") != ACA_BOOTSTRAP_IMAGE
+                and sorted(containers[0].get("env", []), key=lambda entry: entry["name"])
+                == sorted(desired[0].get("env", []), key=lambda entry: entry["name"]),
+                f"{side}: running ACA image/environment differs from approved state.")
+    print("Both ACA latest revisions are running with their approved system identities and internal ingress.")
+    print("Inference and native Search are NOT verified by ARM or /health; run a six-way book comparison through the UI.")
+
+
 def verify(session):
     targets, outputs = applied_targets(session)
     deadline = time.monotonic() + session.args.timeout
@@ -1692,6 +1903,7 @@ def verify(session):
             require(error.code in (404, 429, 500, 502, 503, 504),
                     f"Foundry readiness GET failed (HTTP {error.code}); check RBAC and endpoint.")
         time.sleep(min(10, remaining()))
+    verify_aca(session, outputs)
     if outputs.get("ui_url"):
         health = public_url(outputs["ui_url"], ".azurecontainerapps.io") + "/health"
         session.account()
@@ -1714,6 +1926,8 @@ def parser():
         ("apply", "Show and separately approve one exact saved binary plan."),
         ("build-images", "Separately approve local linux/amd64 image build and ACR push."),
         ("plan-workloads", "Explicitly plan workloads with verified actual image digests."),
+        ("plan-aca-bootstrap", "Plan create-only system-identity ACA shells and grants before private images; never apply."),
+        ("plan-model-capacity", "Plan only equal capacity reductions of the four existing models before ACA bootstrap."),
         ("plan-project-search-rbac", "Plan ONLY the two project-MI Search role creates. "
          "Preserves workloads and applied images; authenticated ARM checks; never apply."),
         ("route-agents", "Separately approved non-provisioner routing of existing agents only. "
@@ -1729,9 +1943,9 @@ def parser():
             backend.add_argument("--local-development", action="store_true")
             backend.add_argument("--backend-config", help="Private existing azurerm backend config path.")
         if name == "apply":
-            sub.add_argument("--stage", choices=("foundation", "workloads", "project-search-rbac"), required=True)
+            sub.add_argument("--stage", choices=("foundation", "model-capacity", "aca-bootstrap", "workloads", "project-search-rbac"), required=True)
             sub.add_argument("--plan", required=True, help="Saved deployment/.artifacts/plans/.../plan.bin.")
-        if name in ("verify", "plan-workloads", "apply"):
+        if name in ("verify", "plan-workloads", "plan-aca-bootstrap", "apply"):
             sub.add_argument("--timeout", type=int, default=600, help="Readiness deadline in seconds (1..3600).")
     return result
 
@@ -1750,6 +1964,10 @@ def main(argv=None):
             plan_stage(session, "foundation")
         elif args.command == "plan-workloads":
             plan_stage(session, "workloads")
+        elif args.command == "plan-aca-bootstrap":
+            plan_stage(session, "aca-bootstrap")
+        elif args.command == "plan-model-capacity":
+            plan_stage(session, "model-capacity")
         elif args.command == "plan-project-search-rbac":
             plan_stage(session, "project-search-rbac")
         elif args.command == "apply":

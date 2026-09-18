@@ -1,7 +1,31 @@
+variable "aca_bootstrap" {
+  type        = bool
+  nullable    = false
+  description = "Create isolated public-image shells and their system identity grants before deploying private runtime images."
+}
+
+variable "project_id" {
+  type        = string
+  nullable    = false
+  description = "Foundry project scope for ACA runtime inference permissions."
+}
+
+variable "registry_id" {
+  type        = string
+  nullable    = false
+  description = "Shared registry scope for ACA system-assigned AcrPull grants."
+}
+
+variable "subscription_id" {
+  type        = string
+  nullable    = false
+  description = "Subscription used to qualify built-in role definitions."
+}
+
 variable "account_id" {
   type        = string
   nullable    = false
-  description = "Foundry AIServices account ARM ID; parent for the four dedicated per-agent model deployments."
+  description = "Foundry AIServices account ARM ID; parent for the six dedicated per-agent model deployments."
 }
 
 variable "agent_config" {
@@ -71,29 +95,29 @@ variable "model_deployments" {
     capacity = number
   }))
   nullable    = false
-  description = "Dedicated per-agent-side GlobalStandard model deployment name/capacity, keyed by prompt/prompt_none/hosted/hosted_none. Each agent gets its own TPM/RPM budget so one agent's concurrent load cannot skew another's latency; all four must share model_name/model_version and have identical capacity so the comparison stays fair."
+  description = "Six dedicated GlobalStandard model deployments, keyed by prompt/prompt_none/hosted/hosted_none/aca/aca_none, with distinct names and identical model/version/capacity. Shared service limits can still affect latency."
 
   validation {
     condition = (
-      toset(keys(var.model_deployments)) == toset(["prompt", "prompt_none", "hosted", "hosted_none"]) &&
-      length(distinct([for d in values(var.model_deployments) : d.name])) == 4 &&
+      toset(keys(var.model_deployments)) == toset(["prompt", "prompt_none", "hosted", "hosted_none", "aca", "aca_none"]) &&
+      length(distinct([for d in values(var.model_deployments) : d.name])) == 6 &&
       length(distinct([for d in values(var.model_deployments) : d.capacity])) == 1 &&
       alltrue([for d in values(var.model_deployments) : d.capacity >= 1 && d.capacity <= 1000 && floor(d.capacity) == d.capacity])
     )
-    error_message = "Supply exactly prompt/prompt_none/hosted/hosted_none entries with four distinct names and one identical integer capacity (1-1000)."
+    error_message = "Supply prompt/prompt_none/hosted/hosted_none/aca/aca_none with six distinct names and one identical integer capacity (1-1000)."
   }
 }
 
 variable "model_name" {
   type        = string
   nullable    = false
-  description = "Verified OpenAI model catalog name, shared by all four dedicated deployments."
+  description = "Verified OpenAI model catalog name, shared by all six dedicated deployments."
 }
 
 variable "model_version" {
   type        = string
   nullable    = false
-  description = "Explicit verified OpenAI model catalog version, shared by all four dedicated deployments."
+  description = "Explicit verified OpenAI model catalog version, shared by all six dedicated deployments."
 }
 
 variable "name_token" {

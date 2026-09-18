@@ -1,3 +1,13 @@
+output "aca_bootstrap" {
+  description = "True only while the new ACA system identities are being bootstrapped."
+  value       = var.aca_bootstrap
+}
+
+output "aca_apps" {
+  description = "Internal ACA runtime URLs and system principal IDs, absent during foundation bootstrap."
+  value       = var.deploy_workloads ? module.workloads[0].aca_apps : null
+}
+
 output "account_id" {
   description = "Foundry AIServices account ARM ID."
   value       = module.foundry.account_id
@@ -80,7 +90,7 @@ output "model_deployment_name" {
 }
 
 output "model_deployment_names" {
-  description = "Dedicated per-agent-side model deployment names (prompt, prompt_none, hosted, hosted_none), null during foundation bootstrap."
+  description = "Six dedicated model deployment names (prompt, prompt_none, hosted, hosted_none, aca, aca_none), null during foundation bootstrap."
   value       = var.deploy_workloads ? module.workloads[0].model_deployment_names : null
 }
 
