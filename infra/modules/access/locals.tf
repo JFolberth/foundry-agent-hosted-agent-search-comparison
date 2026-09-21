@@ -4,11 +4,13 @@ locals {
   # https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agent-permissions
   # https://learn.microsoft.com/azure/role-based-access-control/built-in-roles/containers#acrpull
   # https://learn.microsoft.com/azure/search/search-security-rbac
+  # https://learn.microsoft.com/azure/role-based-access-control/built-in-roles/monitor#log-analytics-data-reader
   role_ids = {
     acr_pull                   = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
     acr_push                   = "8311e382-0749-4cb8-b61a-304f252e45ec"
     agent_consumer             = "eed3b665-ab3a-47b6-8f48-c9382fb1dad6"
     foundry_user               = "53ca6127-db72-4b80-b1b0-d745d6d5456d"
+    log_analytics_data_reader  = "3b03c2da-16b3-4a49-8834-0f8130efdd3b"
     search_data_contributor    = "8ebe5a00-799e-43f5-93ac-243d3dce84a7"
     search_service_contributor = "7ca78c08-252a-4471-8644-bb5ff32d4ba0"
   }
@@ -71,6 +73,11 @@ locals {
       principal_id = var.ui_principal_id
       role_id      = local.role_ids.agent_consumer
       scope        = var.project_id
+    }
+    ui_log_analytics_read = {
+      principal_id = var.ui_principal_id
+      role_id      = local.role_ids.log_analytics_data_reader
+      scope        = var.log_analytics_workspace_id
     }
   }
 }

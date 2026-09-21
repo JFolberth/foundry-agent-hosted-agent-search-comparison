@@ -237,10 +237,11 @@ resource "azapi_resource" "web" {
           resources = { cpu = 0.5, memory = "1Gi" }
           env = concat(
             [for key, value in merge(local.runtime_environment, {
-              AZURE_CLIENT_ID          = var.ui_identity_client_id
-              FOUNDRY_PROJECT_ENDPOINT = var.project_endpoint
-              PROMPT_AGENT_NAME_NONE   = var.prompt_agent_name_none
-              HOSTED_AGENT_NAME_NONE   = var.hosted_agent_name_none
+              AZURE_CLIENT_ID            = var.ui_identity_client_id
+              FOUNDRY_PROJECT_ENDPOINT   = var.project_endpoint
+              PROMPT_AGENT_NAME_NONE     = var.prompt_agent_name_none
+              HOSTED_AGENT_NAME_NONE     = var.hosted_agent_name_none
+              LOG_ANALYTICS_WORKSPACE_ID = var.log_analytics_workspace_customer_id
               # Validation/display only: routing for prompt/hosted is fixed at
               # Terraform registration/per-resource env override, each using its
               # OWN dedicated deployment (see azapi_resource.model above).

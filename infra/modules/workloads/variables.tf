@@ -89,6 +89,12 @@ variable "location" {
   description = "Azure region for the UI Container App."
 }
 
+variable "log_analytics_workspace_customer_id" {
+  type        = string
+  nullable    = false
+  description = "Shared Log Analytics workspace customer ID (GUID), passed to the UI container for querying its last-14-runs latency history via the Azure Monitor Query SDK."
+}
+
 variable "model_deployments" {
   type = map(object({
     name     = string

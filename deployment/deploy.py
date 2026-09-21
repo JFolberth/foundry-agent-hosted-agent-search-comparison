@@ -30,6 +30,8 @@ PROJECT_SEARCH_ROLES = {
     "project_search_data": "8ebe5a00-799e-43f5-93ac-243d3dce84a7",
     "project_search_service": "7ca78c08-252a-4471-8644-bb5ff32d4ba0",
 }
+# https://learn.microsoft.com/azure/role-based-access-control/built-in-roles/monitor#log-analytics-data-reader
+UI_LOG_ANALYTICS_ROLE = "3b03c2da-16b3-4a49-8834-0f8130efdd3b"
 # Self-contained registry: this script never imports src/comparison (stdlib-only,
 # separately security-audited). Side is the Terraform resource local name; kind
 # is the actual Microsoft.Foundry/agents schema "kind" field.
@@ -228,6 +230,23 @@ RESTRICTED PROJECT SEARCH RBAC REPAIR (not part of normal workload deployment)
     Planning does NOT authorize apply. Never set deploy_workloads=false to repair
     RBAC on an existing deployment. Normal workload/foundation guards remain.
   https://learn.microsoft.com/azure/foundry/agents/how-to/tools/ai-search#troubleshooting
+
+RESTRICTED UI LOG ANALYTICS RBAC REPAIR (not part of normal workload deployment)
+  plan-ui-log-analytics-rbac --environment ENV --tfvars PATH
+    Preparation ONLY. Preserves deploy_workloads=true and pins BOTH images from
+    applied resource bodies, ignoring current build provenance/unapplied images.
+    Authenticated ARM GETs bind the applied UI identity and the existing Log
+    Analytics workspace to the requested subscription.
+    Permits exactly one CREATE: module.access.azapi_resource.assignment key
+    ui_log_analytics_read (Log Analytics Data Reader), at that workspace scope
+    for that UI identity only. No updates, deletes, image/config changes,
+    imports, state moves, other grants, or extra resources can be bundled.
+    Saves the actual binary, private plan text, approval context and SHA256.
+  apply --stage ui-log-analytics-rbac --plan deployment/.artifacts/plans/PLAN/plan.bin
+    A separate terminal APPROVE <sha256> is still required. Rechecks exact plan,
+    inputs, applied-state/images hash and authoritative ARM principal/scope.
+    Planning does NOT authorize apply. Never set deploy_workloads=false to repair
+    RBAC on an existing deployment. Normal workload/foundation guards remain.
 
 SECURITY / COST
   Hosted containers use the current Responses protocol 2.0.0 and the current
@@ -1018,6 +1037,128 @@ def project_search_rbac_guard(session, plan, context):
             "RBAC repair cannot bundle output changes; refresh/review state separately.")
 
 
+def ui_log_analytics_rbac_context(session):
+    values = session.state()
+    outputs = {key: item["value"] for key, item in values.get("outputs", {}).items()}
+    require(outputs.get("deploy_workloads") is True,
+            "UI Log Analytics RBAC repair requires existing workloads; never disable them to repair RBAC.")
+    resources = state_resources(values)
+    identity_id = outputs.get("ui_identity_id")
+    require(isinstance(identity_id, str) and re.fullmatch(
+        r"/subscriptions/" + re.escape(session.target["subscription_id"])
+        + r"/resourceGroups/[a-zA-Z0-9_.()-]+/providers/Microsoft\.ManagedIdentity"
+          r"/userAssignedIdentities/[a-zA-Z0-9_-]+", identity_id, re.I),
+        "UI identity ARM ID must belong to the requested subscription.")
+    identity_state = resources.get("module.platform.azapi_resource.ui_identity", {}).get("values", {})
+    principal = outputs.get("ui_identity_principal_id")
+    require(isinstance(principal, str) and GUID.fullmatch(principal.lower())
+            and identity_state.get("id") == identity_id
+            and (identity_state.get("output") or {}).get("properties", {}).get("principalId", "").lower()
+            == principal.lower(),
+            "Applied UI identity principal/resource binding is missing or inconsistent.")
+    remote_identity = azure_request(session, "https://management.azure.com" + identity_id
+                                    + "?api-version=2023-01-31", "https://management.azure.com/")
+    require(isinstance(remote_identity.get("id"), str) and remote_identity["id"].lower() == identity_id.lower()
+            and (remote_identity.get("properties") or {}).get("principalId", "").lower() == principal.lower(),
+            "Authoritative ARM UI identity differs from applied state.")
+    scope = outputs.get("log_analytics_workspace_id")
+    require(isinstance(scope, str) and re.fullmatch(
+        r"/subscriptions/" + re.escape(session.target["subscription_id"])
+        + r"/resourceGroups/[a-zA-Z0-9_.()-]+/providers/Microsoft\.OperationalInsights/workspaces/[a-zA-Z0-9-]+",
+        scope, re.I), "Log Analytics RBAC scope must be a workspace in the requested subscription.")
+    workspace_state = resources.get("module.platform.azapi_resource.logs", {}).get("values", {})
+    require(workspace_state.get("id") == scope, "Log Analytics scope does not match applied workspace state.")
+    remote_workspace = azure_request(session, "https://management.azure.com" + scope + "?api-version=2023-09-01",
+                                     "https://management.azure.com/")
+    require(isinstance(remote_workspace.get("id"), str) and remote_workspace["id"].lower() == scope.lower(),
+            "Authoritative ARM Log Analytics workspace differs from the approved scope.")
+    hosted = resources.get("module.workloads[0].azapi_data_plane_resource.hosted", {}).get("values", {})
+    web = resources.get("module.workloads[0].azapi_resource.web", {}).get("values", {})
+    containers = web.get("body", {}).get("properties", {}).get("template", {}).get("containers", [])
+    require(len(containers) == 1 and containers[0].get("name") == "web",
+            "Expected one applied UI container; refusing to infer an image.")
+    _, registry = session.registry(outputs)
+    images = {
+        "hosted_image": hosted.get("body", {}).get("definition", {}).get("container_configuration", {}).get("image"),
+        "web_image": containers[0].get("image"),
+    }
+    for kind, image in images.items():
+        require(isinstance(image, str) and re.fullmatch(
+            re.escape(registry) + r"/search-" + kind.split("_")[0] + r"@sha256:[0-9a-f]{64}", image),
+            "RBAC repair requires actual applied workload image digests in the shared ACR.")
+    return {"principal_id": principal, "workspace_id": scope, "images": images,
+            "state_sha256": source_hash(values)}
+
+
+def ui_log_analytics_rbac_guard(session, plan, context):
+    require(isinstance(context, dict), "Missing authenticated UI Log Analytics RBAC approval context.")
+    prior = plan.get("prior_state", {}).get("values", {}).get("outputs", {})
+    for output, expected in (
+        ("deploy_workloads", True), ("ui_identity_principal_id", context["principal_id"]),
+        ("log_analytics_workspace_id", context["workspace_id"]),
+    ):
+        require(prior.get(output, {}).get("value") == expected,
+                "Saved RBAC plan prior state differs from the authenticated applied target.")
+    allowed = {'module.access.azapi_resource.assignment["ui_log_analytics_read"]': UI_LOG_ANALYTICS_ROLE}
+
+    def unknown_value(value):
+        if isinstance(value, dict):
+            return any(unknown_value(item) for item in value.values())
+        if isinstance(value, list):
+            return any(unknown_value(item) for item in value)
+        return value is True
+
+    seen = set()
+    for resource in plan.get("resource_changes", []):
+        change = resource.get("change", {})
+        actions = change.get("actions")
+        if actions == ["no-op"] or (resource.get("mode") == "data" and actions == ["read"]):
+            require(not change.get("importing") and not resource.get("previous_address"),
+                    "RBAC repair cannot import or move resources.")
+            continue
+        address = resource.get("address")
+        require(address in allowed and address not in seen and resource.get("mode") == "managed"
+                and resource.get("type") == "azapi_resource" and actions == ["create"]
+                and change.get("before") is None and not change.get("importing")
+                and not resource.get("previous_address"),
+                "RBAC repair permits only CREATE of the UI Log Analytics Data Reader role assignment; "
+                "all other creates, updates, deletes, replacements, imports and moves are refused.")
+        role = allowed[address]
+        after = change.get("after") or {}
+        expected_name = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                            f"{context['workspace_id']}/{context['principal_id']}/{role}".lower()))
+        properties = {
+            "principalId": context["principal_id"],
+            "principalType": "ServicePrincipal",
+            "roleDefinitionId": (f"/subscriptions/{session.target['subscription_id']}"
+                                 f"/providers/Microsoft.Authorization/roleDefinitions/{role}"),
+        }
+        require(after.get("type") == "Microsoft.Authorization/roleAssignments@2022-04-01"
+                and after.get("parent_id") == context["workspace_id"]
+                and after.get("name") == expected_name
+                and after.get("body") == {"properties": properties},
+                "RBAC assignment does not exactly match approved UI principal, role, workspace scope and name.")
+        unknown = change.get("after_unknown", {})
+        require(not any(unknown_value(unknown.get(key))
+                        for key in ("type", "parent_id", "name", "body", "sensitive_body"))
+                and not after.get("sensitive_body") and not after.get("sensitive_body_version")
+                and not after.get("create_headers") and not after.get("create_query_parameters"),
+                "Unknown/hidden RBAC request fields or create overrides cannot be approved.")
+        seen.add(address)
+    require(seen == set(allowed), "RBAC repair must create exactly the missing UI Log Analytics assignment.")
+    require(all(change.get("actions") == ["no-op"]
+                for change in plan.get("output_changes", {}).values()),
+            "RBAC repair cannot bundle output changes; refresh/review state separately.")
+
+
+def rbac_context_for(session, stage):
+    if stage == "model-capacity":
+        return model_capacity_context(session)
+    if stage == "ui-log-analytics-rbac":
+        return ui_log_analytics_rbac_context(session)
+    return project_search_rbac_context(session)
+
+
 def validate_plan(session, plan, stage, images=None, rbac_context=None):
     require(plan.get("errored") is not True and plan.get("applyable") is not False,
             "The saved plan is not applicable.")
@@ -1037,6 +1178,8 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
         require(images is not None, "Workloads plan requires verified image provenance.")
         if stage == "project-search-rbac":
             project_search_rbac_guard(session, plan, rbac_context)
+        elif stage == "ui-log-analytics-rbac":
+            ui_log_analytics_rbac_guard(session, plan, rbac_context)
         elif stage == "model-capacity":
             model_capacity_guard(plan)
         else:
@@ -1044,7 +1187,7 @@ def validate_plan(session, plan, stage, images=None, rbac_context=None):
         for key, value in images.items():
             require(variables.get(key) == value, "Saved plan image differs from approved build.")
     planned = plan.get("planned_values", {}).get("outputs", {}).get("deploy_workloads", {})
-    if stage in ("model-capacity", "aca-bootstrap") and not planned:
+    if stage in ("model-capacity", "aca-bootstrap", "ui-log-analytics-rbac") and not planned:
         require(prior.get("deploy_workloads", {}).get("value") is True,
                 "Targeted stage requires existing enabled workloads when its output is omitted.")
         planned = prior["deploy_workloads"]
@@ -1102,11 +1245,8 @@ def plan_stage(session, stage):
     rbac_context = None
     if stage == "foundation":
         session.foundation_safe(outputs)
-    elif stage == "project-search-rbac":
-        rbac_context = project_search_rbac_context(session)
-        images = rbac_context["images"]
-    elif stage == "model-capacity":
-        rbac_context = model_capacity_context(session)
+    elif stage in ("project-search-rbac", "ui-log-analytics-rbac", "model-capacity"):
+        rbac_context = rbac_context_for(session, stage)
         images = rbac_context["images"]
     else:
         images, provenance = image_inputs(session, outputs)
@@ -1119,7 +1259,7 @@ def plan_stage(session, stage):
               "aca_bootstrap": stage == "aca-bootstrap"}
     if stage == "foundation":
         values.update(hosted_image=None, web_image=None)
-    elif stage in ("project-search-rbac", "model-capacity"):
+    elif stage in ("project-search-rbac", "ui-log-analytics-rbac", "model-capacity"):
         values.update(images)
     overrides = folder / "stage.tfvars.json"
     write_json(overrides, values)
@@ -1129,7 +1269,9 @@ def plan_stage(session, stage):
         args.extend(f"-target={address}" for address in sorted(ACA_ASSIGNMENTS))
     if stage == "model-capacity":
         args.extend(f'-target=module.workloads[0].azapi_resource.model["{side}"]' for side in AGENT_SIDES)
-    if images and stage not in ("project-search-rbac", "model-capacity"):
+    if stage == "ui-log-analytics-rbac":
+        args.append('-target=module.access.azapi_resource.assignment["ui_log_analytics_read"]')
+    if images and stage not in ("project-search-rbac", "ui-log-analytics-rbac", "model-capacity"):
         args.append(f"-var-file={ARTIFACTS / 'images.tfvars.json'}")
     args += [f"-var-file={overrides}", f"-out={binary}"]
     session.tf(*args, log=folder / "plan.log", accepted=(0, 2))
@@ -1139,7 +1281,7 @@ def plan_stage(session, stage):
     require(inputs == infra_inputs() and tfvars_hash == digest(session.tfvars.read_bytes()),
             "Inputs changed during planning; discard this plan and explicitly plan again.")
     if rbac_context:
-        current_context = model_capacity_context(session) if stage == "model-capacity" else project_search_rbac_context(session)
+        current_context = rbac_context_for(session, stage)
         require(current_context == rbac_context,
                 "Authenticated RBAC target or applied image/state changed during planning; discard the plan.")
     elif images:
@@ -1177,8 +1319,8 @@ def apply_stage(session):
         images, provenance = image_inputs(session, outputs)
         require(images == record["images"] and provenance == record["provenance"],
                 "Saved plan does not match current approved image provenance.")
-    elif stage in ("project-search-rbac", "model-capacity"):
-        rbac_context = model_capacity_context(session) if stage == "model-capacity" else project_search_rbac_context(session)
+    elif stage in ("project-search-rbac", "ui-log-analytics-rbac", "model-capacity"):
+        rbac_context = rbac_context_for(session, stage)
         images = rbac_context["images"]
         require(rbac_context == record.get("rbac_context") and images == record["images"],
                 "Applied state/images or authenticated RBAC target changed; create a fresh RBAC plan.")
@@ -1191,7 +1333,7 @@ def apply_stage(session):
         if stage in ("workloads", "aca-bootstrap"):
             require(image_inputs(session, outputs) == (record["images"], record["provenance"]),
                     "Image inputs changed after plan approval.")
-        elif stage in ("project-search-rbac", "model-capacity"):
+        elif stage in ("project-search-rbac", "ui-log-analytics-rbac", "model-capacity"):
             require(source_hash(session.state()) == rbac_context["state_sha256"],
                     "Applied state changed after RBAC plan approval; create a fresh plan.")
 
@@ -1207,8 +1349,8 @@ def apply_stage(session):
     unchanged()
     if stage == "foundation":
         session.foundation_safe(session.outputs())
-    elif stage in ("project-search-rbac", "model-capacity"):
-        current_context = model_capacity_context(session) if stage == "model-capacity" else project_search_rbac_context(session)
+    elif stage in ("project-search-rbac", "ui-log-analytics-rbac", "model-capacity"):
+        current_context = rbac_context_for(session, stage)
         require(current_context == rbac_context,
                 "Authenticated RBAC scope/principal changed after approval; no apply performed.")
         unchanged()
@@ -1930,6 +2072,8 @@ def parser():
         ("plan-model-capacity", "Plan only equal capacity reductions of the four existing models before ACA bootstrap."),
         ("plan-project-search-rbac", "Plan ONLY the two project-MI Search role creates. "
          "Preserves workloads and applied images; authenticated ARM checks; never apply."),
+        ("plan-ui-log-analytics-rbac", "Plan ONLY the UI identity's Log Analytics Data Reader role create. "
+         "Preserves workloads and applied images; authenticated ARM checks; never apply."),
         ("route-agents", "Separately approved non-provisioner routing of existing agents only. "
          "Requires both versions active (otherwise wait/retry). Shows private SHA256-bound diffs; "
          "terminal ROUTE <sha256> approves PATCH, not Terraform apply. Then run verify."),
@@ -1943,7 +2087,10 @@ def parser():
             backend.add_argument("--local-development", action="store_true")
             backend.add_argument("--backend-config", help="Private existing azurerm backend config path.")
         if name == "apply":
-            sub.add_argument("--stage", choices=("foundation", "model-capacity", "aca-bootstrap", "workloads", "project-search-rbac"), required=True)
+            sub.add_argument("--stage", choices=(
+                "foundation", "model-capacity", "aca-bootstrap", "workloads",
+                "project-search-rbac", "ui-log-analytics-rbac",
+            ), required=True)
             sub.add_argument("--plan", required=True, help="Saved deployment/.artifacts/plans/.../plan.bin.")
         if name in ("verify", "plan-workloads", "plan-aca-bootstrap", "apply"):
             sub.add_argument("--timeout", type=int, default=600, help="Readiness deadline in seconds (1..3600).")
@@ -1970,6 +2117,8 @@ def main(argv=None):
             plan_stage(session, "model-capacity")
         elif args.command == "plan-project-search-rbac":
             plan_stage(session, "project-search-rbac")
+        elif args.command == "plan-ui-log-analytics-rbac":
+            plan_stage(session, "ui-log-analytics-rbac")
         elif args.command == "apply":
             apply_stage(session)
         elif args.command == "build-images":

@@ -66,6 +66,13 @@
           <h2 id="comparison-heading">Responses</h2>
           <p id="comparison-id" class="comparison-id">Comparison ID: —</p>
         </div>
+        <section id="latency-chart" class="latency-chart" aria-labelledby="latency-chart-heading" hidden>
+          <h3 id="latency-chart-heading">Latency by agent (last 14 runs)</h3>
+          <p class="latency-definition">Server-measured wall-clock time per agent, from when this service starts that
+            agent’s turn until its full response is parsed — includes that agent’s own model and search calls,
+            excludes network time between your browser and the server.</p>
+          <ul id="latency-chart-list" class="latency-list"></ul>
+        </section>
         <p id="status" class="status" role="status" aria-live="polite" aria-atomic="true">Send a question to compare all six agents.</p>
         <div id="last-question" class="last-question" hidden>
           <h3>Latest question</h3>

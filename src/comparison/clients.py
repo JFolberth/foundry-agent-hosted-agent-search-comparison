@@ -17,15 +17,19 @@ AGENT_SETTINGS_FIELD = {
 }
 
 
-async def open_clients(stack: AsyncExitStack, settings: Settings, *, hosted=False):
+def default_credential():
     system_identity = os.getenv("MANAGED_IDENTITY_MODE") == "system"
-    credential = (
+    return (
         DefaultAzureCredential()
         if os.getenv("COMPARISON_LOCAL_DEVELOPMENT") == "true"
         else ManagedIdentityCredential(**(
             {} if system_identity else {"client_id": os.getenv("AZURE_CLIENT_ID")}
         ))
     )
+
+
+async def open_clients(stack: AsyncExitStack, settings: Settings, *, hosted=False):
+    credential = default_credential()
     await stack.enter_async_context(credential)
     project = await stack.enter_async_context(AIProjectClient(
         endpoint=settings.project_endpoint,

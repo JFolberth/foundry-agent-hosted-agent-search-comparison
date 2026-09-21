@@ -13,6 +13,11 @@ test('introduces metadata-grounded book recommendations without promising plot s
   assert.match(html, /book metadata, not plot summaries/);
 });
 
+test('defines what latency measures next to the aggregate chart', () => {
+  assert.match(html, /Server-measured wall-clock time per agent/);
+  assert.match(html, /excludes network time between your browser and the server/);
+});
+
 class Node {
   constructor(tag = 'div') {
     this.tagName = tag;
@@ -38,19 +43,28 @@ class Node {
   focus() { this.focused = true; }
 }
 
-function setup(fetchHandler, navigator = {}, configResponse = { ok: true, json: async () => ({ deployed_at: null }) }) {
+function setup(
+  fetchHandler, navigator = {}, configResponse = { ok: true, json: async () => ({ deployed_at: null }) },
+  latencyResponse = { ok: true, json: async () => ({ runs: [], available: false }) }
+) {
   const nodes = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Node()]));
   const requests = [];
+  let latencyCalls = 0;
   vm.runInNewContext(source, {
     document: {
       getElementById(id) {
         assert.ok(nodes.has(id), `HTML must define ${id}`);
         return nodes.get(id);
       },
-      createElement: (tag) => new Node(tag)
+      createElement: (tag) => new Node(tag),
+      createElementNS: (_ns, tag) => new Node(tag)
     },
     fetch: async (url, options) => {
       if (url === '/api/config') return configResponse;
+      if (url === '/api/latency-history') {
+        latencyCalls += 1;
+        return typeof latencyResponse === 'function' ? latencyResponse(latencyCalls) : latencyResponse;
+      }
       requests.push({ url, ...options, body: JSON.parse(options.body) });
       return fetchHandler(requests.length);
     },
@@ -263,6 +277,7 @@ test('distinguishes unavailable tool evidence from zero observed records and pre
   const pre = descendants(app.nodes.get('hosted-content')).find((node) => node.tagName === 'pre');
   assert.deepEqual(JSON.parse(pre.textContent), raw);
   assert.match(app.content('hosted'), /Reasoning tokens0/);
+  assert.match(app.content('hosted'), /Latency is server-measured wall-clock time/);
   const zero = setup(() => response());
   await zero.submit();
   assert.match(zero.content('prompt'), /0 observed tool records/);
@@ -785,4 +800,64 @@ test('preserves prior continuations and histories after network failure or missi
     assert.equal(request.body.history.prompt.length, 2);
     assert.equal(request.body.history.hosted.length, 2);
   }
+});
+
+test('charts latency across all six agents for the run just completed, ranked against the slowest', async () => {
+  const runs = [{
+    comparison_id: 'c-1',
+    latencies: { prompt_none: 300, prompt: 900, hosted_none: 1200, hosted: 2100, aca_none: null, aca: 600 }
+  }];
+  const app = setup(() => response(), {}, undefined, { ok: true, json: async () => ({ runs, available: true }) });
+  await app.submit();
+  assert.equal(app.nodes.get('latency-chart').hidden, false);
+  const rows = app.nodes.get('latency-chart-list').children;
+  assert.equal(rows.length, 6);
+  assert.equal(rows[1].className, 'latency-row kind-prompt');
+  const [label, svg, value] = rows[1].children;
+  assert.equal(label.textContent, '02 · Prompt Low');
+  assert.equal(svg.tagName, 'svg');
+  assert.equal(svg.children.length, 1);
+  assert.equal(svg.children[0].tagName, 'rect');
+  assert.match(svg.children[0].attributes.class, /run-bar-current/);
+  assert.equal(value.textContent, '0.9 s');
+  assert.equal(rows[4].children[2].textContent, 'Not reported');
+  assert.match(rows[4].children[1].children[0].attributes.class, /run-bar-missing/);
+  assert.equal(rows[5].children[2].textContent, '0.6 s');
+});
+
+test('re-fetches latency history from the server after each successful comparison, not after a failed one', async () => {
+  let calls = 0;
+  const latencyResponse = () => {
+    calls += 1;
+    return {
+      ok: true,
+      json: async () => ({ runs: [{ comparison_id: `c-${calls}`, latencies: { prompt: 100 * calls } }], available: true })
+    };
+  };
+  const app = setup(
+    (count) => count === 2 ? (() => { throw new TypeError('Network offline'); })() : response(),
+    {}, undefined, latencyResponse
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  await app.submit('First');
+  assert.equal(calls, 2);
+  assert.equal(app.nodes.get('latency-chart-list').children[1].children[2].textContent, '0.2 s');
+  await app.submit('Second');
+  assert.equal(calls, 2, 'a failed comparison must not trigger another history fetch');
+  await app.submit('Third');
+  assert.equal(calls, 3);
+});
+
+test('fetches and renders latency history from the server immediately on page load, before any comparison', async () => {
+  const runs = [{ comparison_id: 'c-1', latencies: { prompt: 700 } }];
+  const app = setup(() => response(), {}, undefined, { ok: true, json: async () => ({ runs, available: true }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(app.nodes.get('latency-chart').hidden, false);
+  const rows = app.nodes.get('latency-chart-list').children;
+  assert.equal(rows[1].children[2].textContent, '0.7 s');
+
+  const empty = setup(() => response());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(empty.nodes.get('latency-chart').hidden, true);
 });

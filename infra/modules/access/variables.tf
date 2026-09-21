@@ -16,6 +16,12 @@ variable "execution_principal_id" {
   description = "Current Terraform identity object ID; receives project-scoped agent authoring and registry-scoped image push only."
 }
 
+variable "log_analytics_workspace_id" {
+  type        = string
+  nullable    = false
+  description = "Shared Log Analytics workspace ARM ID; scope for the UI identity's read-only query grant (last-14-runs latency history)."
+}
+
 variable "project_id" {
   type        = string
   nullable    = false

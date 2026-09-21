@@ -19,6 +19,11 @@ output "log_analytics_workspace_id" {
   value       = azapi_resource.logs.id
 }
 
+output "log_analytics_workspace_customer_id" {
+  description = "Shared Log Analytics workspace customer ID (GUID); required by the Azure Monitor Query SDK, distinct from the ARM ID used for RBAC scope."
+  value       = tostring(data.azapi_resource.logs.output.properties.customerId)
+}
+
 output "registry_id" {
   description = "Shared Basic ACR ARM ID."
   value       = azapi_resource.registry.id
