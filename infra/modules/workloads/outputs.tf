@@ -1,3 +1,12 @@
+output "aca_apps" {
+  description = "System-assigned ACA runtime resources; bootstrap URLs must not receive inference requests."
+  value = { for side, app in azapi_resource.aca : side => {
+    id           = app.id
+    principal_id = app.identity[0].principal_id
+    url          = "https://${app.output.properties.configuration.ingress.fqdn}"
+  } }
+}
+
 output "hosted_agent_identity_principal_id" {
   description = "Platform-created hosted agent identity, NOT the project MI. May remain null until provisioning completes; no extra grant is needed for project inference."
   value       = try(tostring(azapi_data_plane_resource.hosted.output.principal_id), null)
@@ -49,7 +58,7 @@ output "prompt_none_agent_version" {
 }
 
 output "model_deployment_names" {
-  description = "Dedicated per-agent-side model deployment names (prompt, prompt_none, hosted, hosted_none); each agent uses its own to avoid cross-agent latency contention."
+  description = "Six dedicated model deployment names (prompt, prompt_none, hosted, hosted_none, aca, aca_none)."
   value       = { for side, deployment in azapi_resource.model : side => deployment.name }
 }
 

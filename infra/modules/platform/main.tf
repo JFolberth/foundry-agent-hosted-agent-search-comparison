@@ -23,6 +23,14 @@ resource "azapi_resource" "logs" {
   }
 }
 
+# Read-only lookup: the Azure Monitor Query SDK needs the workspace's customer ID
+# (GUID), not its ARM resource ID used elsewhere for RBAC scope.
+data "azapi_resource" "logs" {
+  type                   = "Microsoft.OperationalInsights/workspaces@2023-09-01"
+  resource_id            = azapi_resource.logs.id
+  response_export_values = ["properties.customerId"]
+}
+
 resource "azapi_resource" "application_insights" {
   type      = "Microsoft.Insights/components@2020-02-02"
   name      = "appi-${var.name_token}"

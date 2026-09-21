@@ -1,4 +1,5 @@
 from contextlib import AsyncExitStack
+from unittest.mock import Mock
 
 from azure.core.credentials import AccessToken
 
@@ -37,3 +38,14 @@ async def test_open_clients_skips_unconfigured_none_sides(settings, monkeypatch)
     async with AsyncExitStack() as stack:
         clients = await open_clients(stack, settings)
     assert set(clients) == {"prompt", "hosted"}
+
+
+async def test_system_identity_ignores_legacy_client_id(settings, monkeypatch):
+    monkeypatch.setenv("MANAGED_IDENTITY_MODE", "system")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "legacy-user-assigned-client")
+    monkeypatch.delenv("COMPARISON_LOCAL_DEVELOPMENT", raising=False)
+    credential = Mock(return_value=Credential())
+    monkeypatch.setattr("comparison.clients.ManagedIdentityCredential", credential)
+    async with AsyncExitStack() as stack:
+        await open_clients(stack, settings, hosted=True)
+    credential.assert_called_once_with()

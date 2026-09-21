@@ -1,3 +1,10 @@
+variable "aca_bootstrap" {
+  type        = bool
+  default     = false
+  nullable    = false
+  description = "One-time ACA system-identity bootstrap before private image pulls. Use plan-aca-bootstrap, then plan-workloads; never re-bootstrap active agents."
+}
+
 variable "deploy_workloads" {
   type        = bool
   default     = false
@@ -96,16 +103,16 @@ variable "model_deployments" {
     capacity = number
   }))
   nullable    = false
-  description = "Dedicated per-agent-side GlobalStandard model deployment name/capacity, keyed by prompt/prompt_none/hosted/hosted_none. Isolates each agent's TPM/RPM budget so concurrent calls from the other agents cannot skew one agent's latency; all four must have identical capacity so the comparison stays fair."
+  description = "Six dedicated GlobalStandard model deployments, keyed by prompt/prompt_none/hosted/hosted_none/aca/aca_none, with distinct names and identical capacity. Shared service limits can still affect latency."
 
   validation {
     condition = (
-      toset(keys(var.model_deployments)) == toset(["prompt", "prompt_none", "hosted", "hosted_none"]) &&
-      length(distinct([for d in values(var.model_deployments) : d.name])) == 4 &&
+      toset(keys(var.model_deployments)) == toset(["prompt", "prompt_none", "hosted", "hosted_none", "aca", "aca_none"]) &&
+      length(distinct([for d in values(var.model_deployments) : d.name])) == 6 &&
       length(distinct([for d in values(var.model_deployments) : d.capacity])) == 1 &&
       alltrue([for d in values(var.model_deployments) : d.capacity >= 1 && d.capacity <= 1000 && floor(d.capacity) == d.capacity])
     )
-    error_message = "Supply exactly prompt/prompt_none/hosted/hosted_none entries with four distinct names and one identical integer capacity (1-1000)."
+    error_message = "Supply prompt/prompt_none/hosted/hosted_none/aca/aca_none with six distinct names and one identical integer capacity (1-1000)."
   }
 }
 

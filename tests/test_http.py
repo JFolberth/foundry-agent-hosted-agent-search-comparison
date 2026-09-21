@@ -1,12 +1,14 @@
 import asyncio
 import json
 from html.parser import HTMLParser
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 from starlette.testclient import TestClient
 from azure.ai.agentserver.responses import InMemoryResponseProvider, ResponseContext
+from azure.monitor.query import LogsQueryStatus
 
 from comparison.config import load_config, model_options
 from comparison.contracts import MAX_HISTORY_CHARS, MAX_HISTORY_MESSAGES, MAX_RAW_BYTES, MAX_RAW_ITEMS, MAX_TURNS
@@ -59,6 +61,45 @@ def test_web_routes_contract_and_safe_validation(raw_response):
         assert client.post(
             "/api/compare", content=b"x" * 65537, headers={"content-type": "application/json"},
         ).status_code == 413
+
+
+def test_latency_history_reports_unavailable_without_a_configured_logs_client(raw_response):
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    service = ComparisonService(clients, load_config())
+    with TestClient(create_app(service)) as client:
+        response = client.get("/api/latency-history")
+        assert response.status_code == 200
+        assert response.json() == {"runs": [], "available": False}
+
+
+def test_latency_history_returns_runs_from_the_configured_logs_client(raw_response):
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    service = ComparisonService(clients, load_config())
+    runs = [{"comparison_id": "11111111-1111-1111-1111-111111111111", "latencies": {"prompt": 900}}]
+    logs_client = SimpleNamespace(query_workspace=AsyncMock(return_value=SimpleNamespace(
+        status=LogsQueryStatus.SUCCESS,
+        tables=[SimpleNamespace(
+            columns=["comparisonId", "sides"],
+            rows=[[runs[0]["comparison_id"], runs[0]["latencies"]]],
+        )],
+    )))
+    with TestClient(create_app(service, logs_client=logs_client)) as client:
+        response = client.get("/api/latency-history")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["available"] is True
+    assert body["runs"][0]["comparison_id"] == runs[0]["comparison_id"]
+    assert body["runs"][0]["latencies"]["prompt"] == 900
+
+
+def test_latency_history_degrades_gracefully_when_the_query_fails(raw_response):
+    clients = {side: fake_client(raw_response) for side in ("prompt", "hosted")}
+    service = ComparisonService(clients, load_config())
+    logs_client = SimpleNamespace(query_workspace=AsyncMock(side_effect=RuntimeError("query failed")))
+    with TestClient(create_app(service, logs_client=logs_client)) as client:
+        response = client.get("/api/latency-history")
+    assert response.status_code == 200
+    assert response.json() == {"runs": [], "available": False}
 
 
 def test_web_page_referenced_assets_are_served(raw_response):

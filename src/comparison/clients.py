@@ -1,10 +1,11 @@
 import os
 from contextlib import AsyncExitStack
 
+import aiohttp
 from azure.ai.projects.aio import AIProjectClient
 from azure.identity.aio import DefaultAzureCredential, ManagedIdentityCredential
 
-from .agents import AGENT_SIDES
+from .aca import ACAClient
 from .config import Settings
 from .contracts import MODEL_TIMEOUT
 
@@ -16,12 +17,19 @@ AGENT_SETTINGS_FIELD = {
 }
 
 
-async def open_clients(stack: AsyncExitStack, settings: Settings, *, hosted=False):
-    credential = (
+def default_credential():
+    system_identity = os.getenv("MANAGED_IDENTITY_MODE") == "system"
+    return (
         DefaultAzureCredential()
         if os.getenv("COMPARISON_LOCAL_DEVELOPMENT") == "true"
-        else ManagedIdentityCredential(client_id=os.getenv("AZURE_CLIENT_ID"))
+        else ManagedIdentityCredential(**(
+            {} if system_identity else {"client_id": os.getenv("AZURE_CLIENT_ID")}
+        ))
     )
+
+
+async def open_clients(stack: AsyncExitStack, settings: Settings, *, hosted=False):
+    credential = default_credential()
     await stack.enter_async_context(credential)
     project = await stack.enter_async_context(AIProjectClient(
         endpoint=settings.project_endpoint,
@@ -32,8 +40,8 @@ async def open_clients(stack: AsyncExitStack, settings: Settings, *, hosted=Fals
         client = project.get_openai_client(timeout=MODEL_TIMEOUT, max_retries=0)
         return await stack.enter_async_context(client)
     result = {}
-    for side in AGENT_SIDES:
-        name = getattr(settings, AGENT_SETTINGS_FIELD[side])
+    for side, field in AGENT_SETTINGS_FIELD.items():
+        name = getattr(settings, field)
         if name is None:
             # Rolling deploys may register the no-reasoning agents after the
             # low-reasoning pair; skip sides the environment hasn't wired yet.
@@ -42,4 +50,8 @@ async def open_clients(stack: AsyncExitStack, settings: Settings, *, hosted=Fals
             agent_name=name, timeout=MODEL_TIMEOUT + 10, max_retries=0,
         )
         result[side] = await stack.enter_async_context(client)
+    if settings.aca_endpoint:
+        session = await stack.enter_async_context(aiohttp.ClientSession(trust_env=False))
+        result["aca"] = ACAClient(session, settings.aca_endpoint)
+        result["aca_none"] = ACAClient(session, settings.aca_endpoint_none)
     return result

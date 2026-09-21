@@ -1,7 +1,7 @@
-# Four dedicated per-agent model deployments (workload-scoped, not the single
+# Six dedicated per-agent model deployments (workload-scoped, not the single
 # account-level foundation deployment): isolates each agent's TPM/RPM budget so
 # concurrent calls from the other three agents cannot skew one agent's latency.
-# deploy.py's plan validator enforces that all four share model/version/capacity
+# deploy.py's plan validator enforces that all six share model/version/capacity
 # and only the deployment name differs, keeping the comparison fair.
 resource "azapi_resource" "model" {
   for_each  = var.model_deployments
@@ -237,10 +237,11 @@ resource "azapi_resource" "web" {
           resources = { cpu = 0.5, memory = "1Gi" }
           env = concat(
             [for key, value in merge(local.runtime_environment, {
-              AZURE_CLIENT_ID          = var.ui_identity_client_id
-              FOUNDRY_PROJECT_ENDPOINT = var.project_endpoint
-              PROMPT_AGENT_NAME_NONE   = var.prompt_agent_name_none
-              HOSTED_AGENT_NAME_NONE   = var.hosted_agent_name_none
+              AZURE_CLIENT_ID            = var.ui_identity_client_id
+              FOUNDRY_PROJECT_ENDPOINT   = var.project_endpoint
+              PROMPT_AGENT_NAME_NONE     = var.prompt_agent_name_none
+              HOSTED_AGENT_NAME_NONE     = var.hosted_agent_name_none
+              LOG_ANALYTICS_WORKSPACE_ID = var.log_analytics_workspace_customer_id
               # Validation/display only: routing for prompt/hosted is fixed at
               # Terraform registration/per-resource env override, each using its
               # OWN dedicated deployment (see azapi_resource.model above).
@@ -254,6 +255,9 @@ resource "azapi_resource" "web" {
               # Refreshed on every apply so the UI footer can confirm a redeploy
               # actually reached this container, instead of guessing from cache.
               DEPLOYED_AT = timestamp()
+              }, var.aca_bootstrap ? {} : {
+              ACA_ENDPOINT      = "https://${azapi_resource.aca["aca"].output.properties.configuration.ingress.fqdn}"
+              ACA_ENDPOINT_NONE = "https://${azapi_resource.aca["aca_none"].output.properties.configuration.ingress.fqdn}"
             }) : { name = key, value = value }],
             [{ name = "APPLICATIONINSIGHTS_CONNECTION_STRING", secretRef = "application-insights" }]
           )

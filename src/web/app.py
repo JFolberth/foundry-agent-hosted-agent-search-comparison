@@ -13,11 +13,12 @@ from comparison.cancellation import while_connected
 from comparison.config import ROOT, Settings, load_config
 from comparison.contracts import CompareRequest, MAX_HISTORY_CHARS, MAX_HISTORY_MESSAGES, MAX_MESSAGE, MAX_TURNS
 from comparison.guard import RequestGuard
+from comparison.latency_history import fetch_latency_runs, open_logs_query_client
 from comparison.service import ComparisonService
 from comparison.telemetry import configure_telemetry, tracer
 
 
-def create_app(service=None):
+def create_app(service=None, logs_client=None):
     config = load_config()
 
     @asynccontextmanager
@@ -28,12 +29,16 @@ def create_app(service=None):
                 settings = Settings.from_env()
                 clients = await open_clients(stack, settings)
                 app.state.service = ComparisonService(clients, config)
+            if app.state.logs_client is None and app.state.log_workspace_id:
+                app.state.logs_client = await open_logs_query_client(stack)
             app.state.ready = True
             yield
             app.state.ready = False
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.service = service
+    app.state.logs_client = logs_client
+    app.state.log_workspace_id = environ.get("LOG_ANALYTICS_WORKSPACE_ID")
     app.state.ready = service is not None
     app.add_middleware(RequestGuard)
 
@@ -92,6 +97,17 @@ def create_app(service=None):
                 ),
             },
         }
+
+    @app.get("/api/latency-history")
+    async def latency_history():
+        if app.state.logs_client is None:
+            return {"runs": [], "available": False}
+        try:
+            runs = await fetch_latency_runs(app.state.logs_client, app.state.log_workspace_id)
+        except Exception:
+            return {"runs": [], "available": False}
+        return {"runs": runs, "available": True}
+
 
     @app.post("/api/compare")
     async def compare(request: CompareRequest, connection: Request):

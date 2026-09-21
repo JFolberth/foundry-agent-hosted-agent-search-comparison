@@ -8,9 +8,14 @@ const source = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 
 test('introduces metadata-grounded book recommendations without promising plot summaries', () => {
-  assert.match(html, /One book catalog\. Four agents\./);
+  assert.match(html, /One book catalog\. Six agents\./);
   assert.match(html, /Recommend three books by Agatha Christie/);
   assert.match(html, /book metadata, not plot summaries/);
+});
+
+test('defines what latency measures next to the aggregate chart', () => {
+  assert.match(html, /Server-measured wall-clock time per agent/);
+  assert.match(html, /excludes network time between your browser and the server/);
 });
 
 class Node {
@@ -38,19 +43,28 @@ class Node {
   focus() { this.focused = true; }
 }
 
-function setup(fetchHandler, navigator = {}, configResponse = { ok: true, json: async () => ({ deployed_at: null }) }) {
+function setup(
+  fetchHandler, navigator = {}, configResponse = { ok: true, json: async () => ({ deployed_at: null }) },
+  latencyResponse = { ok: true, json: async () => ({ runs: [], available: false }) }
+) {
   const nodes = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Node()]));
   const requests = [];
+  let latencyCalls = 0;
   vm.runInNewContext(source, {
     document: {
       getElementById(id) {
         assert.ok(nodes.has(id), `HTML must define ${id}`);
         return nodes.get(id);
       },
-      createElement: (tag) => new Node(tag)
+      createElement: (tag) => new Node(tag),
+      createElementNS: (_ns, tag) => new Node(tag)
     },
     fetch: async (url, options) => {
       if (url === '/api/config') return configResponse;
+      if (url === '/api/latency-history') {
+        latencyCalls += 1;
+        return typeof latencyResponse === 'function' ? latencyResponse(latencyCalls) : latencyResponse;
+      }
       requests.push({ url, ...options, body: JSON.parse(options.body) });
       return fetchHandler(requests.length);
     },
@@ -77,8 +91,8 @@ function result(overrides = {}) {
 }
 
 function response(prompt = result(), hosted = result(), extra = {}) {
-  const { prompt_none = result(), hosted_none = result(), ...rest } = extra;
-  return { ok: true, json: async () => ({ comparison_id: 'comparison-123', prompt, hosted, prompt_none, hosted_none, ...rest }) };
+  const { prompt_none = result(), hosted_none = result(), aca = result(), aca_none = result(), ...rest } = extra;
+  return { ok: true, json: async () => ({ comparison_id: 'comparison-123', prompt, hosted, prompt_none, hosted_none, aca, aca_none, ...rest }) };
 }
 
 function descendants(node) {
@@ -114,7 +128,7 @@ test('discloses different agent storage semantics and distinguishes local reset 
   const notice = html.match(/<aside\b[^>]*>([\s\S]*?)<\/aside>/)[1].replace(/\s+/g, ' ');
   assert.match(notice, /Only use non-sensitive demo content/);
   assert.match(notice, /Prompt agents:<\/strong> Foundry stores their conversations and responses/);
-  assert.match(notice, /Hosted agents:<\/strong> replay their browser-held history on each turn with <code>store=False<\/code>/);
+  assert.match(notice, /Hosted and ACA agents:<\/strong> replay their browser-held history on each turn with <code>store=False<\/code>/);
   assert.match(notice, /not a guarantee of zero service-side retention/);
   assert.match(notice, /Neither this reset nor expiry of the demo’s 20-minute continuation token deletes Foundry-stored prompt conversations or responses/);
   assert.doesNotMatch(notice, /stores conversations and responses for both agents/);
@@ -129,8 +143,8 @@ test('discloses different agent storage semantics and distinguishes local reset 
   assert.match(app.nodes.get('status').textContent, /Browser histories and continuation tokens cleared/);
   assert.match(app.nodes.get('status').textContent, /Foundry-stored prompt conversations and responses are not deleted/);
   await app.submit('New conversation');
-  assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [] });
-  assert.deepEqual(app.requests[1].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null });
+  assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [], aca: [], aca_none: [] });
+  assert.deepEqual(app.requests[1].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null, aca: null, aca_none: null });
 });
 
 test('discloses server-truncated output separately from tool evidence and text-history clipping', async () => {
@@ -163,8 +177,8 @@ test('uses one backend request, independently retains only successful history, a
   assert.equal(app.requests[0].method, 'POST');
   assert.deepEqual(app.requests[0].body, {
     message: 'First question',
-    history: { prompt: [], hosted: [], prompt_none: [], hosted_none: [] },
-    continuation: { prompt: null, hosted: null, prompt_none: null, hosted_none: null },
+    history: { prompt: [], hosted: [], prompt_none: [], hosted_none: [], aca: [], aca_none: [] },
+    continuation: { prompt: null, hosted: null, prompt_none: null, hosted_none: null, aca: null, aca_none: null },
     session: app.requests[0].body.session
   });
   assert.equal(typeof app.requests[0].body.session.hosted, 'string');
@@ -176,13 +190,15 @@ test('uses one backend request, independently retains only successful history, a
     prompt: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'Prompt answer' }],
     hosted: [],
     prompt_none: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'An answer' }],
-    hosted_none: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'An answer' }]
+    hosted_none: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'An answer' }],
+    aca: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'An answer' }],
+    aca_none: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'An answer' }]
   });
   assert.equal(app.nodes.get('comparison-id').textContent, 'Comparison ID: comparison-123');
   app.reset();
   assert.equal(app.nodes.get('last-question').hidden, true);
   await app.submit('Fresh question');
-  assert.deepEqual(app.requests[2].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [] });
+  assert.deepEqual(app.requests[2].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [], aca: [], aca_none: [] });
 });
 
 test('bounds each history to twenty messages without mixing agent answers', async () => {
@@ -222,7 +238,7 @@ test('enforces per-message and aggregate history character limits while retainin
   assert.equal(latest.history.prompt[1].content.length, 12000);
   assert.equal(latest.history.hosted.length, 4);
   assert.equal(latest.history.hosted[0].content, '2'.repeat(4000));
-  assert.deepEqual(latest.continuation, { prompt: 'prompt-3', hosted: 'hosted-3', prompt_none: null, hosted_none: null });
+  assert.deepEqual(latest.continuation, { prompt: 'prompt-3', hosted: 'hosted-3', prompt_none: null, hosted_none: null, aca: null, aca_none: null });
   assert.ok(app.content('prompt').includes(longAnswer));
   assert.match(app.content('prompt'), /Only its first 12,000 characters are kept in text history/);
   assert.doesNotMatch(app.content('hosted'), /Only its first/);
@@ -242,7 +258,7 @@ test('expired continuation errors retain prior side state and display reset guid
   assert.match(app.content('prompt'), /Continuation expired. Start a new comparison/);
   assert.match(app.content('prompt'), /select New comparison/);
   await app.submit('Third');
-  assert.deepEqual(app.requests[2].body.continuation, { prompt: 'prompt-original', hosted: 'hosted-next', prompt_none: null, hosted_none: null });
+  assert.deepEqual(app.requests[2].body.continuation, { prompt: 'prompt-original', hosted: 'hosted-next', prompt_none: null, hosted_none: null, aca: null, aca_none: null });
   assert.equal(app.requests[2].body.history.prompt.length, 2);
   assert.equal(app.requests[2].body.history.hosted.length, 4);
 });
@@ -261,6 +277,7 @@ test('distinguishes unavailable tool evidence from zero observed records and pre
   const pre = descendants(app.nodes.get('hosted-content')).find((node) => node.tagName === 'pre');
   assert.deepEqual(JSON.parse(pre.textContent), raw);
   assert.match(app.content('hosted'), /Reasoning tokens0/);
+  assert.match(app.content('hosted'), /Latency is server-measured wall-clock time/);
   const zero = setup(() => response());
   await zero.submit();
   assert.match(zero.content('prompt'), /0 observed tool records/);
@@ -370,7 +387,7 @@ test('reset restores both neutral empty states and removes previous evidence and
   const app = setup(() => response(result({ text: 'Previous answer', conversation_id: 'previous-id' })));
   await app.submit();
   app.reset();
-  for (const [agent, number] of [['prompt', '01'], ['hosted', '02'], ['prompt_none', '03'], ['hosted_none', '04']]) {
+  for (const [agent, number] of [['prompt_none', '01'], ['prompt', '02'], ['hosted_none', '03'], ['hosted', '04'], ['aca_none', '05'], ['aca', '06']]) {
     const empty = app.nodes.get(`${agent}-content`).children[0];
     assert.equal(empty.className, 'empty-state');
     assert.equal(empty.children[0].textContent, number);
@@ -658,7 +675,7 @@ test('handles network, HTTP, and invalid JSON failures in both panels without sa
     assert.equal(app.nodes.get('submit').disabled, false);
     assert.equal(app.nodes.get('message').value, 'Failed turn');
     await app.submit('Retry');
-    assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [] });
+    assert.deepEqual(app.requests[1].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [], aca: [], aca_none: [] });
   }
 });
 
@@ -672,18 +689,42 @@ test('missing agent results do not discard the other successful answer', async (
   assert.equal(app.requests[1].body.history.hosted.length, 0);
 });
 
-test('has no reasoning control; each panel labels its fixed reasoning effort and renders as a 2x2 grid', async () => {
+test('groups Prompt, Hosted and ACA rows with None before Low in each row', async () => {
   assert.doesNotMatch(html, /id="reasoning"/);
   assert.doesNotMatch(html, /reasoning-control/);
-  assert.match(html, /01 \/ Prompt · Low reasoning/);
-  assert.match(html, /02 \/ Hosted · Low reasoning/);
-  assert.match(html, /03 \/ Prompt · No reasoning/);
-  assert.match(html, /04 \/ Hosted · No reasoning/);
+  assert.match(html, /01 \/ Prompt · No reasoning/);
+  assert.match(html, /02 \/ Prompt · Low reasoning/);
+  assert.match(html, /03 \/ Hosted · No reasoning/);
+  assert.match(html, /04 \/ Hosted · Low reasoning/);
+  assert.match(html, /05 \/ ACA · No reasoning/);
+  assert.match(html, /06 \/ ACA · Low reasoning/);
+  assert.deepEqual([...html.matchAll(/<article id="([^"]+)-panel"/g)].map((match) => match[1]),
+    ['prompt_none', 'prompt', 'hosted_none', 'hosted', 'aca_none', 'aca']);
   const app = setup(() => response());
   await app.submit();
   assert.deepEqual(Object.keys(app.requests[0].body).sort(), ['continuation', 'history', 'message', 'session']);
-  assert.deepEqual(Object.keys(app.requests[0].body.history).sort(), ['hosted', 'hosted_none', 'prompt', 'prompt_none']);
+  assert.deepEqual(Object.keys(app.requests[0].body.history).sort(), ['aca', 'aca_none', 'hosted', 'hosted_none', 'prompt', 'prompt_none']);
   assert.deepEqual(Object.keys(app.requests[0].body.session).sort(), ['hosted', 'hosted_none']);
+});
+
+test('ACA keeps independent successful history and distinct runtime IDs without Foundry session or continuation', async () => {
+  const app = setup((count) => response(result(), result(), {
+    aca: result({ text: `ACA answer ${count}`, response_id: 'runtime-id', model_response_id: 'model-id',
+      hosted_runtime_trace_id: 'aca-trace', continuation: 'must-not-save' }),
+    aca_none: count === 1 ? result({ text: '', error: 'Runtime unavailable' }) : result({ text: 'None answer' })
+  }));
+  await app.submit('First');
+  assert.match(app.content('aca'), /ACA runtime responseruntime-id/);
+  assert.match(app.content('aca'), /ACA model responsemodel-id/);
+  assert.match(app.content('aca'), /ACA runtime · App Insights operation \/ trace IDaca-trace/);
+  assert.doesNotMatch(app.content('aca'), /Foundry agent response|Hosted runtime|must-not-save/);
+  await app.submit('Next');
+  assert.deepEqual(app.requests[1].body.history.aca, [
+    { role: 'user', content: 'First' }, { role: 'assistant', content: 'ACA answer 1' }
+  ]);
+  assert.deepEqual(app.requests[1].body.history.aca_none, []);
+  assert.equal(app.requests[1].body.continuation.aca, null);
+  assert.deepEqual(Object.keys(app.requests[1].body.session).sort(), ['hosted', 'hosted_none']);
 });
 
 test('sends a stable per-chat hosted session id across turns, and a fresh one after reset', async () => {
@@ -715,19 +756,19 @@ test('sends opaque continuations independently, advances successful sides only, 
     return response(result({ continuation: 'prompt-latest' }), result({ continuation: 'hosted-next' }));
   });
   await app.submit('First');
-  assert.deepEqual(app.requests[0].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null });
+  assert.deepEqual(app.requests[0].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null, aca: null, aca_none: null });
   assert.equal(app.content('prompt').includes(promptToken), false);
   assert.equal(app.content('hosted').includes(hostedToken), false);
   await app.submit('Second');
-  assert.deepEqual(app.requests[1].body.continuation, { prompt: promptToken, hosted: hostedToken, prompt_none: null, hosted_none: null });
+  assert.deepEqual(app.requests[1].body.continuation, { prompt: promptToken, hosted: hostedToken, prompt_none: null, hosted_none: null, aca: null, aca_none: null });
   await app.submit('Third');
-  assert.deepEqual(app.requests[2].body.continuation, { prompt: 'prompt-next', hosted: hostedToken, prompt_none: null, hosted_none: null });
+  assert.deepEqual(app.requests[2].body.continuation, { prompt: 'prompt-next', hosted: hostedToken, prompt_none: null, hosted_none: null, aca: null, aca_none: null });
   assert.equal(app.requests[2].body.history.prompt.length, 4);
   assert.equal(app.requests[2].body.history.hosted.length, 2);
   app.reset();
   await app.submit('Fresh');
-  assert.deepEqual(app.requests[3].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null });
-  assert.deepEqual(app.requests[3].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [] });
+  assert.deepEqual(app.requests[3].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null, aca: null, aca_none: null });
+  assert.deepEqual(app.requests[3].body.history, { prompt: [], hosted: [], prompt_none: [], hosted_none: [], aca: [], aca_none: [] });
 });
 
 test('clears stale continuation when a successful response returns null, missing, or invalid values', async () => {
@@ -738,7 +779,7 @@ test('clears stale continuation when a successful response returns null, missing
     await app.submit('First');
     await app.submit('Second');
     await app.submit('Third');
-    assert.deepEqual(app.requests[2].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null });
+    assert.deepEqual(app.requests[2].body.continuation, { prompt: null, hosted: null, prompt_none: null, hosted_none: null, aca: null, aca_none: null });
     assert.equal(app.requests[2].body.history.prompt.length, 4);
     assert.equal(app.requests[2].body.history.hosted.length, 4);
   }
@@ -755,8 +796,68 @@ test('preserves prior continuations and histories after network failure or missi
   await app.submit('Missing answers');
   await app.submit('Retry');
   for (const request of app.requests.slice(1)) {
-    assert.deepEqual(request.body.continuation, { prompt: 'prompt-token', hosted: 'hosted-token', prompt_none: null, hosted_none: null });
+    assert.deepEqual(request.body.continuation, { prompt: 'prompt-token', hosted: 'hosted-token', prompt_none: null, hosted_none: null, aca: null, aca_none: null });
     assert.equal(request.body.history.prompt.length, 2);
     assert.equal(request.body.history.hosted.length, 2);
   }
+});
+
+test('charts latency across all six agents for the run just completed, ranked against the slowest', async () => {
+  const runs = [{
+    comparison_id: 'c-1',
+    latencies: { prompt_none: 300, prompt: 900, hosted_none: 1200, hosted: 2100, aca_none: null, aca: 600 }
+  }];
+  const app = setup(() => response(), {}, undefined, { ok: true, json: async () => ({ runs, available: true }) });
+  await app.submit();
+  assert.equal(app.nodes.get('latency-chart').hidden, false);
+  const rows = app.nodes.get('latency-chart-list').children;
+  assert.equal(rows.length, 6);
+  assert.equal(rows[1].className, 'latency-row kind-prompt');
+  const [label, svg, value] = rows[1].children;
+  assert.equal(label.textContent, '02 · Prompt Low');
+  assert.equal(svg.tagName, 'svg');
+  assert.equal(svg.children.length, 1);
+  assert.equal(svg.children[0].tagName, 'rect');
+  assert.match(svg.children[0].attributes.class, /run-bar-current/);
+  assert.equal(value.textContent, '0.9 s');
+  assert.equal(rows[4].children[2].textContent, 'Not reported');
+  assert.match(rows[4].children[1].children[0].attributes.class, /run-bar-missing/);
+  assert.equal(rows[5].children[2].textContent, '0.6 s');
+});
+
+test('re-fetches latency history from the server after each successful comparison, not after a failed one', async () => {
+  let calls = 0;
+  const latencyResponse = () => {
+    calls += 1;
+    return {
+      ok: true,
+      json: async () => ({ runs: [{ comparison_id: `c-${calls}`, latencies: { prompt: 100 * calls } }], available: true })
+    };
+  };
+  const app = setup(
+    (count) => count === 2 ? (() => { throw new TypeError('Network offline'); })() : response(),
+    {}, undefined, latencyResponse
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  await app.submit('First');
+  assert.equal(calls, 2);
+  assert.equal(app.nodes.get('latency-chart-list').children[1].children[2].textContent, '0.2 s');
+  await app.submit('Second');
+  assert.equal(calls, 2, 'a failed comparison must not trigger another history fetch');
+  await app.submit('Third');
+  assert.equal(calls, 3);
+});
+
+test('fetches and renders latency history from the server immediately on page load, before any comparison', async () => {
+  const runs = [{ comparison_id: 'c-1', latencies: { prompt: 700 } }];
+  const app = setup(() => response(), {}, undefined, { ok: true, json: async () => ({ runs, available: true }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(app.nodes.get('latency-chart').hidden, false);
+  const rows = app.nodes.get('latency-chart-list').children;
+  assert.equal(rows[1].children[2].textContent, '0.7 s');
+
+  const empty = setup(() => response());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(empty.nodes.get('latency-chart').hidden, true);
 });

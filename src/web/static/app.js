@@ -5,18 +5,18 @@
   const MAX_HISTORY_MESSAGES = 20;
   const MAX_HISTORY_MESSAGE_LENGTH = 12000;
   const MAX_HISTORY_LENGTH = 24000;
-  // Single source of truth for which Foundry agent each panel calls, its
-  // underlying kind (server-orchestrated prompt vs. self-hosted container),
-  // and its baked-in reasoning effort. Panel ordering here drives the 2x2
-  // results grid: row 1 is the low-reasoning pair, row 2 is no-reasoning.
+  const SVG_NS = 'http://www.w3.org/2000/svg';
   const AGENT_META = {
-    prompt: { kind: 'prompt', reasoningLabel: 'Prompt agent', mark: '01' },
-    hosted: { kind: 'hosted', reasoningLabel: 'Hosted agent', mark: '02' },
-    prompt_none: { kind: 'prompt', reasoningLabel: 'Prompt agent', mark: '03' },
-    hosted_none: { kind: 'hosted', reasoningLabel: 'Hosted agent', mark: '04' }
+    prompt_none: { kind: 'prompt', reasoningLabel: 'Prompt agent', mark: '01', label: 'Prompt None' },
+    prompt: { kind: 'prompt', reasoningLabel: 'Prompt agent', mark: '02', label: 'Prompt Low' },
+    hosted_none: { kind: 'hosted', reasoningLabel: 'Hosted agent', mark: '03', label: 'Hosted None' },
+    hosted: { kind: 'hosted', reasoningLabel: 'Hosted agent', mark: '04', label: 'Hosted Low' },
+    aca_none: { kind: 'aca', reasoningLabel: 'ACA None', mark: '05', label: 'ACA None' },
+    aca: { kind: 'aca', reasoningLabel: 'ACA Low', mark: '06', label: 'ACA Low' }
   };
   const agents = Object.keys(AGENT_META);
   const isHosted = (agent) => AGENT_META[agent].kind === 'hosted';
+  const isRuntime = (agent) => ['hosted', 'aca'].includes(AGENT_META[agent].kind);
   const form = document.getElementById('compare-form');
   const messageInput = document.getElementById('message');
   const submitButton = document.getElementById('submit');
@@ -80,17 +80,19 @@
     feedback.setAttribute('role', 'status');
     feedback.setAttribute('aria-live', 'polite');
     feedback.setAttribute('aria-atomic', 'true');
+    const runtimeLabel = isHosted(agent) ? 'Hosted' : 'ACA';
     const identifiers = [
-      [result.conversation_scope === 'hosted_model' ? 'Hosted model conversation' : 'Foundry conversation', result.conversation_id],
-      ['Foundry agent response', result.response_id],
+      [AGENT_META[agent].kind === 'aca' ? 'ACA model conversation'
+        : result.conversation_scope === 'hosted_model' ? 'Hosted model conversation' : 'Foundry conversation', result.conversation_id],
+      [AGENT_META[agent].kind === 'aca' ? 'ACA runtime response' : 'Foundry agent response', result.response_id],
       ['UI invocation · App Insights operation / trace ID', result.trace_id],
       ['UI invocation span ID', result.span_id]
     ];
-    if (isHosted(agent)) {
-      identifiers.splice(2, 0, ['Hosted model response', result.model_response_id]);
+    if (isRuntime(agent)) {
+      identifiers.splice(2, 0, [`${runtimeLabel} model response`, result.model_response_id]);
       identifiers.push(
-        ['Hosted runtime · App Insights operation / trace ID', result.hosted_runtime_trace_id],
-        ['Hosted runtime span ID', result.hosted_runtime_span_id]
+        [`${runtimeLabel} runtime · App Insights operation / trace ID`, result.hosted_runtime_trace_id],
+        [`${runtimeLabel} runtime span ID`, result.hosted_runtime_span_id]
       );
     }
     for (const [label, value] of identifiers) {
@@ -133,8 +135,8 @@
       body.append(element('p', telemetryNote, 'evidence-note'));
     }
     const hostedTelemetryNote = safeText(result.hosted_runtime_telemetry_note);
-    if (isHosted(agent) && hostedTelemetryNote.trim()) {
-      body.append(element('p', `Hosted runtime telemetry: ${hostedTelemetryNote}`, 'evidence-note'));
+    if (isRuntime(agent) && hostedTelemetryNote.trim()) {
+      body.append(element('p', `${runtimeLabel} runtime telemetry: ${hostedTelemetryNote}`, 'evidence-note'));
     }
     body.append(feedback);
     return section;
@@ -146,7 +148,7 @@
     notice.append(
       element('h4', 'This agent could not complete the request'),
       element('p', safeText(error)),
-      element('p', 'This turn was not added to this agent’s history. Follow the error guidance above, or select New comparison to clear both histories.')
+      element('p', 'This turn was not added to this agent’s history. Follow the error guidance above, or select New comparison to clear all histories.')
     );
     content.replaceChildren(notice, renderCorrelation(agent, result));
     setPanelState(agent, 'Error', 'error');
@@ -177,14 +179,19 @@
       metric('Output tokens', tokenCount(result.usage?.output_tokens)),
       metric('Reasoning tokens', tokenCount(result.usage?.output_tokens_details?.reasoning_tokens))
     );
+    const latencyNote = element('p',
+      'Latency is server-measured wall-clock time for this agent’s full turn (validation through parsed '
+      + 'response); it excludes network time between your browser and the server.',
+      'evidence-note'
+    );
     const note = element('p',
       'Each turn\u2019s counts come straight from that call\u2019s own response and are not carried over from '
       + 'earlier turns. Input tokens still are not directly comparable across agents: the prompt agent\u2019s '
       + 'Foundry-managed conversation resends the full prior history \u2014 including earlier tool results \u2014 '
-      + 'on every turn, while the hosted agent replays only the plain text history and re-searches fresh each time.',
+      + 'on every turn, while hosted and ACA agents replay only the plain text history and re-search fresh each time.',
       'evidence-note'
     );
-    return [metrics, note];
+    return [metrics, latencyNote, note];
   }
 
   function renderTools(result) {
@@ -264,10 +271,70 @@
         ));
       }
       content.append(renderCorrelation(agent, result));
-      continuation[agent] = typeof result.continuation === 'string' ? result.continuation : null;
+      continuation[agent] = AGENT_META[agent].kind !== 'aca' && typeof result.continuation === 'string'
+        ? result.continuation : null;
       return true;
     }
     return false;
+  }
+
+  async function fetchLatencyHistory() {
+    try {
+      const response = await fetch('/api/latency-history');
+      if (!response.ok) return [];
+      const data = await response.json();
+      return Array.isArray(data?.runs) ? data.runs : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function renderLatencyChart(runs) {
+    const list = document.getElementById('latency-chart-list');
+    list.replaceChildren();
+    if (!Array.isArray(runs) || runs.length === 0) {
+      document.getElementById('latency-chart').hidden = true;
+      return;
+    }
+    const latencyOf = (run, agent) => {
+      const value = run?.latencies?.[agent];
+      return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+    };
+    const max = Math.max(1, ...runs.flatMap((run) => agents.map((agent) => latencyOf(run, agent))).filter(
+      (value) => value !== null
+    ));
+    const slotWidth = 140 / runs.length;
+    const barWidth = Math.max(1, slotWidth - Math.max(1, slotWidth * 0.15));
+    for (const agent of agents) {
+      const latest = latencyOf(runs[runs.length - 1], agent);
+      const row = element('li', undefined, `latency-row kind-${AGENT_META[agent].kind}`);
+      const svg = document.createElementNS(SVG_NS, 'svg');
+      svg.setAttribute('class', 'run-chart');
+      svg.setAttribute('viewBox', '0 0 140 32');
+      svg.setAttribute('preserveAspectRatio', 'none');
+      svg.setAttribute('aria-hidden', 'true');
+      runs.forEach((run, index) => {
+        const value = latencyOf(run, agent);
+        const hasValue = value !== null;
+        const barHeight = hasValue ? Math.max(2, (value / max) * 30) : 2;
+        const rect = document.createElementNS(SVG_NS, 'rect');
+        rect.setAttribute('x', String(index * slotWidth));
+        rect.setAttribute('y', String(32 - barHeight));
+        rect.setAttribute('width', String(barWidth));
+        rect.setAttribute('height', String(barHeight));
+        rect.setAttribute('class', `run-bar${hasValue ? '' : ' run-bar-missing'}${index === runs.length - 1 ? ' run-bar-current' : ''}`);
+        svg.append(rect);
+      });
+      row.append(
+        element('span', `${AGENT_META[agent].mark} · ${AGENT_META[agent].label}`, 'latency-label'),
+        svg,
+        element('span', latest === null
+          ? 'Not reported'
+          : `${(latest / 1000).toLocaleString(undefined, { maximumFractionDigits: 2 })} s`, 'latency-value')
+      );
+      list.append(row);
+    }
+    document.getElementById('latency-chart').hidden = false;
   }
 
   form.addEventListener('submit', async (event) => {
@@ -286,7 +353,7 @@
     document.getElementById('comparison-id').textContent = 'Comparison ID: pending';
     document.getElementById('last-question').hidden = false;
     document.getElementById('last-question-text').textContent = question;
-    status.textContent = 'Comparing all four agents. Answers and tool evidence will appear when the server responds.';
+    status.textContent = 'Comparing all six agents. Answers and tool evidence will appear when the server responds.';
     for (const agent of agents) {
       setPanelState(agent, 'Working', 'working');
       document.getElementById(`${agent}-content`).replaceChildren(
@@ -309,6 +376,7 @@
       }
       document.getElementById('comparison-id').textContent =
         `Comparison ID: ${safeText(data.comparison_id) || 'Not reported'}`;
+      renderLatencyChart(await fetchLatencyHistory());
       const outcomes = agents.map((agent) => renderResult(agent, data[agent], question));
       const completed = outcomes.filter(Boolean).length;
       status.textContent = completed === agents.length
@@ -328,7 +396,7 @@
           : error.message || 'The comparison failed. Please try again.';
       for (const agent of agents) showPanelError(agent, text);
       document.getElementById('comparison-id').textContent = 'Comparison ID: unavailable';
-      status.textContent = 'The comparison failed. Both conversation histories are unchanged.';
+      status.textContent = 'The comparison failed. All conversation histories are unchanged.';
     } finally {
       setPending(false);
     }
@@ -365,6 +433,9 @@
     }
     messageInput.focus();
   });
+
+  // Show any previously recorded runs immediately, before the first comparison of this page load.
+  fetchLatencyHistory().then(renderLatencyChart);
 
   // Best-effort deploy timestamp so it's obvious whether the running UI
   // actually reflects the latest deployment, independent of browser caching.

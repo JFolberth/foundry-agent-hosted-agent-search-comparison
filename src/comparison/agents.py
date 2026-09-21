@@ -7,7 +7,7 @@ name strings in multiple places.
 
 from typing import Literal, TypedDict
 
-Kind = Literal["prompt", "hosted"]
+Kind = Literal["prompt", "hosted", "aca"]
 ReasoningEffort = Literal["low", "none"]
 
 
@@ -21,6 +21,8 @@ AGENT_SIDES: dict[str, AgentMeta] = {
     "hosted": {"kind": "hosted", "reasoning_effort": "low"},
     "prompt_none": {"kind": "prompt", "reasoning_effort": "none"},
     "hosted_none": {"kind": "hosted", "reasoning_effort": "none"},
+    "aca": {"kind": "aca", "reasoning_effort": "low"},
+    "aca_none": {"kind": "aca", "reasoning_effort": "none"},
 }
 
 

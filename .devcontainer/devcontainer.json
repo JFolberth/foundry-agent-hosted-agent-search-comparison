@@ -1,7 +1,14 @@
 {
   "name": "foundry-agent-hosted-agent-search-comparison",
-  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "options": ["--platform=linux/amd64"]
+  },
   "runArgs": ["--platform=linux/amd64"],
+  "containerEnv": {
+    "PIP_INDEX_URL": "https://packagefeedproxy.microsoft.io/pypi/simple/",
+    "PIP_TRUSTED_HOST": "packagefeedproxy.microsoft.io"
+  },
   "features": {
     "ghcr.io/devcontainers/features/azure-cli:1": {
       "version": "latest",

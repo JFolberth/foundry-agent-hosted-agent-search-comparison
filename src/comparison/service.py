@@ -25,7 +25,7 @@ def runtime_telemetry(raw, kind):
         name = f"hosted_runtime_{key}"
         value = metadata.get(name)
         values[name] = (
-            value if kind == "hosted" and isinstance(value, str)
+            value if kind in ("hosted", "aca") and isinstance(value, str)
             and re.fullmatch(f"[0-9a-f]{{{length}}}", value) and int(value, 16) else None
         )
     if not all(values.values()):
@@ -34,6 +34,8 @@ def runtime_telemetry(raw, kind):
         "Recorded hosted runtime model span; distinct from the UI invocation span."
         if all(values.values()) else "No recorded hosted runtime telemetry IDs were returned."
     )
+    if kind == "aca":
+        values["hosted_runtime_telemetry_note"] = values["hosted_runtime_telemetry_note"].replace("hosted", "ACA")
     return values
 
 
@@ -61,6 +63,7 @@ class ComparisonService:
         stage = "request.validate"
         diagnostic = None
         kind = kind_of(side)
+        runtime = kind in ("hosted", "aca")
         with tracer.start_as_current_span(
             f"agent.{side}", record_exception=False, set_status_on_exception=False,
             attributes={"comparison.id": comparison_id, "comparison.side": side},
@@ -68,7 +71,7 @@ class ComparisonService:
             try:
                 token = getattr(request.continuation, side)
                 seed = []
-                if kind == "hosted":
+                if runtime:
                     seed = [m.model_dump() for m in getattr(request.history, side)]
                     turns = sum(item["role"] == "user" for item in seed)
                 elif token:
@@ -104,14 +107,16 @@ class ComparisonService:
                             raise ConversationUnavailable()
                     if kind == "prompt":
                         invocation = {"conversation": conversation_id}
-                    else:
+                    elif kind == "hosted":
                         # Reuse the browser's per-chat sandbox across turns to avoid a
                         # cold start on every single request; see HostedSession.
                         hosted_session_id = getattr(request.session, side, None)
                         invocation = {"extra_body": {"agent_session_id": hosted_session_id}} if hosted_session_id else {}
+                    else:
+                        invocation = {}
                     stage = f"{side}.responses.create"
                     response = await self.clients[side].responses.create(
-                        input=(seed if kind == "hosted" else []) + [{"role": "user", "content": request.message}],
+                        input=(seed if runtime else []) + [{"role": "user", "content": request.message}],
                         max_output_tokens=self.config.max_output_tokens,
                         include=["reasoning.encrypted_content"],
                         store=kind == "prompt", stream=False, extra_headers=dict(headers), **invocation,
@@ -120,25 +125,25 @@ class ComparisonService:
                 raw = response.model_dump(mode="json", exclude_unset=True, warnings=False)
                 reported = raw.get("conversation")
                 reported = reported.get("id") if isinstance(reported, dict) else reported
-                if kind == "hosted":
+                if runtime:
                     reported = provider_id(reported)
                     conversation_id = reported
                 if reported is not None and reported != conversation_id:
                     result = error_result("Agent returned a different conversation. Reset before continuing.")
                 else:
-                    result = extract_evidence(raw, hosted=kind == "hosted")
+                    result = extract_evidence(raw, hosted=runtime)
                     result.update(runtime_telemetry(raw, kind))
                     if raw.get("status") != "completed":
                         result["error"] = "Agent response was incomplete or failed. Reset this conversation before retrying."
                         result["continuation"] = None
                         diagnostic = (
-                            from_metadata(raw) if kind == "hosted" else None
+                            from_metadata(raw) if runtime else None
                         ) or failure(
                             stage, kind="UpstreamIncomplete" if raw.get("status") == "incomplete" else "UpstreamFailed",
                             request=getattr(response, "_request_id", None),
                         )
                     elif (kind == "prompt" and conversation_id is None) or (
-                        kind == "hosted" and result["response_id"] is None
+                        runtime and result["response_id"] is None
                     ):
                         result["error"] = "Agent did not return a usable provider conversation continuation. Reset to continue."
                         result["continuation"] = None
@@ -181,6 +186,11 @@ class ComparisonService:
                 )
             )
             result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+            if kind == "aca":
+                result["conversation_scope"] = "aca_runtime"
+                result["conversation_note"] = (
+                    "ACA user/assistant history is resent with each request; no Foundry agent conversation is used."
+                )
             result["error_diagnostics"] = None
             if result["error"] is not None:
                 diagnostic = diagnostic or failure(stage, kind="ValueError")

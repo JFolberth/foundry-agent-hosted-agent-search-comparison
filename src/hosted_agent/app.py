@@ -303,11 +303,14 @@ async def stream_response(client, settings, config, request, context, cancellati
 
 def create_app(client=None, settings=None, store=None):
     config = load_config()
+    runtime_side = os.environ.get("RUNTIME_SIDE", "hosted")
+    if runtime_side not in ("hosted", "hosted_none", "aca", "aca_none"):
+        raise ValueError("Invalid runtime side")
     runtime = {"client": client, "settings": settings, "ready": client is not None}
 
     @asynccontextmanager
     async def lifespan(app):
-        configure_telemetry("comparison-hosted")
+        configure_telemetry(f"comparison-{runtime_side}")
         async with AsyncExitStack() as stack:
             runtime["settings"] = runtime["settings"] or Settings.from_env()
             if runtime["client"] is None:
@@ -339,9 +342,9 @@ def create_app(client=None, settings=None, store=None):
         comparison_id = correlation_id(context.client_headers)
         carrier = {"traceparent": context.client_headers.get("x-client-traceparent", "")}
         with tracer.start_as_current_span(
-            "hosted.model", context=extract(carrier),
+            f"{runtime_side}.model", context=extract(carrier),
             record_exception=False, set_status_on_exception=False,
-            attributes={"comparison.id": comparison_id, "comparison.side": "hosted"},
+            attributes={"comparison.id": comparison_id, "comparison.side": runtime_side},
         ) as span:
             try:
                 async for event in stream_response(
